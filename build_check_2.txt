@@ -1,0 +1,4 @@
+src/types/index.ts(2,12): error TS1109: Expression expected.
+src/types/index.ts(2,21): error TS1011: An element access expression should take an argument.
+src/types/index.ts(3,11): error TS1109: Expression expected.
+src/types/index.ts(6,1): error TS1128: Declaration or statement expected.

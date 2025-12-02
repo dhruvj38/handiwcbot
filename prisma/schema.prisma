@@ -1,0 +1,81 @@
+// This is your Prisma schema file
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  extensions = [vector]
+}
+
+// Server-level memories: events, memes, rules, habits, plans
+model ServerMemory {
+  id        String   @id @default(uuid())
+  serverId  String   // Discord guild ID
+  type      String   // "event", "meme", "rule", "habit", "plan"
+  title     String   // Short human-readable description
+  content   String   @db.Text // Detailed text
+  embedding Unsupported("vector(1536)")? // Vector embedding for similarity search
+  metadata  Json?    // Additional structured data
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([serverId])
+  @@index([type])
+  @@map("server_memories")
+}
+
+// User profiles: personality, preferences, roles, recurring jokes
+model UserProfile {
+  id          String   @id @default(uuid())
+  serverId    String   // Discord guild ID
+  userId      String   // Discord user ID
+  displayName String
+  summary     String   @db.Text // Text description of personality, preferences, roles
+  tags        String[] // Semantic tags: ["Valorant", "support main", "night owl"]
+  embedding   Unsupported("vector(1536)")? // Vector embedding for similarity search
+  metadata    Json?    // Additional structured data
+  lastUpdated DateTime @updatedAt
+  createdAt   DateTime @default(now())
+
+  @@unique([serverId, userId])
+  @@index([serverId])
+  @@index([userId])
+  @@map("user_profiles")
+}
+
+// Raw voice transcripts
+model TranscriptChunk {
+  id        String    @id @default(uuid())
+  serverId  String    // Discord guild ID
+  channelId String    // Voice channel ID
+  userId    String?   // Speaker Discord user ID (nullable if unknown)
+  startedAt DateTime
+  endedAt   DateTime
+  rawText   String    @db.Text // Transcribed text
+  metadata  Json?     // Additional data like audio quality, confidence
+  createdAt DateTime  @default(now())
+
+  @@index([serverId, channelId, startedAt])
+  @@index([userId])
+  @@map("transcript_chunks")
+}
+
+// Session summaries from voice transcripts
+model SessionSummary {
+  id             String   @id @default(uuid())
+  serverId       String   // Discord guild ID
+  channelId      String   // Voice channel ID
+  timeRangeStart DateTime
+  timeRangeEnd   DateTime
+  summaryText    String   @db.Text // High-level summary
+  embedding      Unsupported("vector(1536)")? // Vector embedding for similarity search
+  metadata       Json?    // Structured data: events, plans, memes, user insights
+  createdAt      DateTime @default(now())
+
+  @@index([serverId, channelId, timeRangeStart])
+  @@map("session_summaries")
+}
