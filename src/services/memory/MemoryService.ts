@@ -9,6 +9,7 @@ import {
     TranscriptChunkData,
     SessionSummaryDraft,
 } from '../../types';
+import { ServerBible } from '../profiler/types';
 
 export class MemoryService {
     private aiService: AiService;
@@ -280,5 +281,304 @@ export class MemoryService {
         toDate: Date
     ): Promise<TranscriptChunkData[]> {
         return this.repository.getTranscriptsByUser(serverId, userId, fromDate, toDate);
+    }
+
+    /**
+     * Build server profile from comprehensive server data
+     */
+    async buildServerProfile(data: {
+        serverId: string;
+        serverName: string;
+        serverDescription: string | null;
+        channels: Array<{ id: string; name: string; type: string; topic?: string | null }>;
+        roles: Array<{ id: string; name: string; color: number; memberCount: number; permissions: string[] }>;
+        members: Array<{ id: string; displayName: string; username: string; roles: string[]; isBot: boolean; joinedAt: Date | null }>;
+        messages: Array<{ channelId: string; channelName: string; authorId: string; authorName: string; content: string; timestamp: Date }>;
+    }): Promise<{
+        serverProfile: { summary: string; topics: string[]; culture: string; activeHours: string; keyMembers: string[] };
+        communicationStyle: { slang: string[]; commonPhrases: string[]; emojiStyle: string; messageLength: string; tone: string; capitalization: string; punctuation: string; exampleMessages: string[] };
+        userProfilesCreated: number;
+        memoriesCreated: number;
+    }> {
+        try {
+            logger.info(`Building server profile for ${data.serverName} (${data.serverId})`);
+            logger.info(`Data: ${data.channels.length} channels, ${data.roles.length} roles, ${data.members.length} members, ${data.messages.length} messages`);
+            logger.info(`Message count for analysis: ${data.messages.length} (targeting 100k+ for comprehensive profiling)`);
+
+            // Use AI to analyze the server data
+            const analysis = await this.aiService.analyzeServerData({
+                serverName: data.serverName,
+                serverDescription: data.serverDescription,
+                channels: data.channels,
+                roles: data.roles,
+                members: data.members,
+                messages: data.messages,
+            });
+
+            // Store server profile as a special memory
+            const serverProfileContent = `
+Server: ${data.serverName}
+Summary: ${analysis.serverProfile.summary}
+Topics: ${analysis.serverProfile.topics.join(', ')}
+Culture: ${analysis.serverProfile.culture}
+Active Hours: ${analysis.serverProfile.activeHours}
+Key Members: ${analysis.serverProfile.keyMembers.join(', ')}
+
+Channels: ${data.channels.map(c => `#${c.name}`).join(', ')}
+Roles: ${data.roles.filter(r => r.name !== '@everyone').map(r => r.name).join(', ')}
+`.trim();
+
+            const serverEmbed = await this.aiService.generateEmbedding(serverProfileContent);
+            await this.repository.createServerMemory({
+                serverId: data.serverId,
+                type: 'habit',
+                title: `Server Profile: ${data.serverName}`,
+                content: serverProfileContent,
+                embedding: serverEmbed,
+                metadata: {
+                    isServerProfile: true,
+                    topics: analysis.serverProfile.topics,
+                    culture: analysis.serverProfile.culture,
+                    activeHours: analysis.serverProfile.activeHours,
+                    keyMembers: analysis.serverProfile.keyMembers,
+                    // CRITICAL: Store ALL data for response generation
+                    communicationStyle: analysis.communicationStyle,
+                    operatingManual: analysis.operatingManual || {},
+                    masterPrompt: analysis.masterPrompt || '',
+                    insideJokes: analysis.insideJokes || [],
+                    thingsToAvoid: analysis.thingsToAvoid || [],
+                    wayToFitIn: analysis.wayToFitIn || '',
+                    channelCount: data.channels.length,
+                    roleCount: data.roles.length,
+                    memberCount: data.members.length,
+                    profiledAt: new Date().toISOString(),
+                },
+            });
+
+            // Store user profiles
+            let userProfilesCreated = 0;
+            for (const userProfile of analysis.userProfiles) {
+                try {
+                    const member = data.members.find(m => m.id === userProfile.userId);
+                    const summaryWithDetails = `${userProfile.summary}\n\nPersonality: ${userProfile.personality}\nInterests: ${userProfile.interests.join(', ')}\nActivity Level: ${userProfile.activityLevel}`;
+                    
+                    const embedding = await this.aiService.generateEmbedding(summaryWithDetails);
+                    await this.repository.upsertUserProfile({
+                        serverId: data.serverId,
+                        userId: userProfile.userId,
+                        displayName: userProfile.displayName || member?.displayName || 'Unknown',
+                        summary: summaryWithDetails,
+                        tags: userProfile.tags,
+                        embedding,
+                        metadata: {
+                            personality: userProfile.personality,
+                            interests: userProfile.interests,
+                            activityLevel: userProfile.activityLevel,
+                            roles: member?.roles || [],
+                            profiledAt: new Date().toISOString(),
+                        },
+                    });
+                    userProfilesCreated++;
+                } catch (error) {
+                    logger.error(`Failed to create profile for user ${userProfile.userId}:`, error);
+                }
+            }
+
+            // Store extracted memories
+            let memoriesCreated = 0;
+            for (const memory of analysis.memories) {
+                try {
+                    const embedding = await this.aiService.generateEmbedding(memory.content);
+                    await this.repository.createServerMemory({
+                        serverId: data.serverId,
+                        type: memory.type,
+                        title: memory.title,
+                        content: memory.content,
+                        embedding,
+                        metadata: {
+                            extractedFromProfile: true,
+                            profiledAt: new Date().toISOString(),
+                        },
+                    });
+                    memoriesCreated++;
+                } catch (error) {
+                    logger.error(`Failed to create memory ${memory.title}:`, error);
+                }
+            }
+
+            logger.info(`Server profile built: ${userProfilesCreated} user profiles, ${memoriesCreated} memories`);
+
+            return {
+                serverProfile: analysis.serverProfile,
+                communicationStyle: analysis.communicationStyle,
+                userProfilesCreated,
+                memoriesCreated,
+            };
+        } catch (error) {
+            logger.error('Failed to build server profile:', error);
+            throw error;
+        }
+    }
+
+    /**
+     * Store the Server Bible from the 6-layer profiler
+     */
+    async storeServerBible(serverId: string, bible: ServerBible): Promise<void> {
+        try {
+            logger.info(`Storing Server Bible for ${serverId}: ${bible.metadata.messageCount} messages, ${bible.metadata.chunkCount} chunks`);
+
+            // Build comprehensive content for the server profile
+            const serverProfileContent = `
+# SERVER BIBLE FOR ${bible.coreIdentity.summary}
+
+## CORE IDENTITY
+${bible.coreIdentity.personality.join(', ')}
+Archetypes: ${bible.coreIdentity.archetypes.join(', ')}
+
+## STYLE RULES
+- Capitalization: ${bible.styleRules.capitalization}
+- Punctuation: ${bible.styleRules.punctuation}
+- Emoji: ${bible.styleRules.emojiUsage.frequency} (favorites: ${bible.styleRules.emojiUsage.favorites.slice(0, 5).join('')})
+- Message length: ~${bible.styleRules.messageLength.typical} words (${bible.styleRules.messageLength.style})
+- Slang density: ${Math.round(bible.styleRules.slangDensity * 100)}%
+- Swearing: ${bible.styleRules.swearingLevel}
+- CAPS usage: ${bible.styleRules.capsUsage}
+
+## SLANG DICTIONARY
+${Object.entries(bible.vocabulary.slangDictionary).slice(0, 50).map(([k, v]) => `- "${k}" = ${v}`).join('\n')}
+
+## GREETINGS
+${bible.vocabulary.greetings.slice(0, 10).join(', ')}
+
+## AFFIRMATIVES
+${bible.vocabulary.affirmatives.slice(0, 10).join(', ')}
+`.trim();
+
+            // Store as server profile memory
+            const serverEmbed = await this.aiService.generateEmbedding(serverProfileContent.substring(0, 2000));
+            await this.repository.createServerMemory({
+                serverId,
+                type: 'habit',
+                title: `Server Bible`,
+                content: serverProfileContent,
+                embedding: serverEmbed,
+                metadata: {
+                    isServerProfile: true,
+                    isServerBible: true,
+                    masterPrompt: bible.masterPrompt,
+                    styleRules: bible.styleRules,
+                    vocabulary: bible.vocabulary,
+                    responsePatterns: bible.responsePatterns,
+                    antiPatterns: bible.antiPatterns,
+                    examplePatterns: bible.exampleLibrary.patterns.slice(0, 50),
+                    loreCount: bible.lore.majorEvents.length + bible.lore.memes.length,
+                    userProfileCount: bible.userProfiles.length,
+                    messageCount: bible.metadata.messageCount,
+                    chunkCount: bible.metadata.chunkCount,
+                    generatedAt: bible.metadata.generatedAt.toISOString(),
+                },
+            });
+
+            // Store user profiles
+            for (const userProfile of bible.userProfiles) {
+                try {
+                    const summaryWithDetails = `${userProfile.personality}\n\nSpeech patterns: ${userProfile.speechPatterns.join(', ')}\nInterests: ${userProfile.interests.join(', ')}\nQuirks: ${userProfile.quirks.join(', ')}\nHow to interact: ${userProfile.howToInteract}`;
+                    
+                    const embedding = await this.aiService.generateEmbedding(summaryWithDetails.substring(0, 1000));
+                    await this.repository.upsertUserProfile({
+                        serverId,
+                        userId: userProfile.userId,
+                        displayName: userProfile.displayName,
+                        summary: summaryWithDetails,
+                        tags: userProfile.interests,
+                        embedding,
+                        metadata: {
+                            personality: userProfile.personality,
+                            speechPatterns: userProfile.speechPatterns,
+                            quirks: userProfile.quirks,
+                            howToInteract: userProfile.howToInteract,
+                            profiledAt: new Date().toISOString(),
+                        },
+                    });
+                } catch (error) {
+                    logger.warn(`Failed to store user profile for ${userProfile.displayName}:`, error);
+                }
+            }
+
+            // Store major lore events
+            for (const lore of bible.lore.majorEvents.slice(0, 20)) {
+                try {
+                    const embedding = await this.aiService.generateEmbedding(lore.description);
+                    await this.repository.createServerMemory({
+                        serverId,
+                        type: 'event',
+                        title: lore.title,
+                        content: `${lore.description}\n\nParticipants: ${lore.participants.join(', ')}\nExamples: ${lore.examples.slice(0, 3).join(' | ')}`,
+                        embedding,
+                        metadata: {
+                            memePotential: lore.memePotential,
+                            participants: lore.participants,
+                        },
+                    });
+                } catch (error) {
+                    logger.warn(`Failed to store lore "${lore.title}":`, error);
+                }
+            }
+
+            // Store memes
+            for (const meme of bible.lore.memes.slice(0, 20)) {
+                try {
+                    const embedding = await this.aiService.generateEmbedding(meme.description);
+                    await this.repository.createServerMemory({
+                        serverId,
+                        type: 'meme',
+                        title: meme.title,
+                        content: `${meme.description}\n\nExamples: ${meme.examples.slice(0, 3).join(' | ')}`,
+                        embedding,
+                        metadata: {
+                            memePotential: meme.memePotential,
+                        },
+                    });
+                } catch (error) {
+                    logger.warn(`Failed to store meme "${meme.title}":`, error);
+                }
+            }
+
+            logger.info(`Server Bible stored successfully for ${serverId}`);
+        } catch (error) {
+            logger.error('Failed to store Server Bible:', error);
+            throw error;
+        }
+    }
+
+    /**
+     * Clear ALL memories for a server (destructive!)
+     */
+    async clearAllMemories(serverId: string): Promise<{
+        serverMemories: number;
+        userProfiles: number;
+        sessionSummaries: number;
+        transcriptChunks: number;
+    }> {
+        try {
+            logger.warn(`CLEARING ALL MEMORIES for server ${serverId}`);
+
+            const serverMemories = await this.repository.deleteAllServerMemories(serverId);
+            const userProfiles = await this.repository.deleteAllUserProfiles(serverId);
+            const sessionSummaries = await this.repository.deleteAllSessionSummaries(serverId);
+            const transcriptChunks = await this.repository.deleteAllTranscriptChunks(serverId);
+
+            logger.info(`Cleared: ${serverMemories} memories, ${userProfiles} profiles, ${sessionSummaries} summaries, ${transcriptChunks} transcripts`);
+
+            return {
+                serverMemories,
+                userProfiles,
+                sessionSummaries,
+                transcriptChunks,
+            };
+        } catch (error) {
+            logger.error('Failed to clear memories:', error);
+            throw error;
+        }
     }
 }

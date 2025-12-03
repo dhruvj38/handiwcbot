@@ -37,27 +37,113 @@ export function normalizeTranscriptText(text: string): string {
 }
 
 /**
- * Local speech service using self-hosted Whisper server
+ * Speech service supporting multiple STT providers
+ * - groq: Groq's free Whisper API (recommended - fast and free)
+ * - local: Self-hosted Whisper server
  */
 export class LocalSpeechService {
+    private provider: 'local' | 'groq';
     private serviceUrl: string;
+    private groqApiKey: string;
 
     constructor() {
+        this.provider = config.speech.provider;
         this.serviceUrl = config.speech.serviceUrl;
-        logger.info(`Local speech service configured at: ${this.serviceUrl}`);
+        this.groqApiKey = config.speech.groqApiKey;
+
+        if (this.provider === 'groq') {
+            if (!this.groqApiKey) {
+                logger.warn('GROQ_API_KEY not set! Get a free key at https://console.groq.com');
+            } else {
+                logger.info('Speech service using Groq Whisper API (free & fast)');
+            }
+        } else {
+            logger.info(`Speech service using local Whisper at: ${this.serviceUrl}`);
+        }
     }
 
     /**
-     * Transcribe audio buffer to text using local Whisper server
+     * Transcribe audio buffer to text
      */
     async transcribe(audioBuffer: Buffer, format: string = 'opus'): Promise<TranscriptionResult> {
+        if (this.provider === 'groq') {
+            return this.transcribeWithGroq(audioBuffer, format);
+        } else {
+            return this.transcribeWithLocal(audioBuffer, format);
+        }
+    }
+
+    /**
+     * Transcribe using Groq's free Whisper API
+     */
+    private async transcribeWithGroq(audioBuffer: Buffer, format: string): Promise<TranscriptionResult> {
+        if (!this.groqApiKey) {
+            logger.error('Cannot transcribe: GROQ_API_KEY not set');
+            return { text: '', confidence: 0 };
+        }
+
         try {
             const result = await retryWithBackoff(
                 async () => {
-                    // Create form data for multipart upload
                     const formData = new FormData();
+                    
+                    // Map format to proper MIME type
+                    const mimeTypes: Record<string, string> = {
+                        'wav': 'audio/wav',
+                        'mp3': 'audio/mpeg',
+                        'opus': 'audio/opus',
+                        'ogg': 'audio/ogg',
+                        'webm': 'audio/webm',
+                        'flac': 'audio/flac',
+                    };
+                    const mimeType = mimeTypes[format] || `audio/${format}`;
+                    
+                    // Groq expects the file with a proper extension
+                    const blob = new Blob([audioBuffer], { type: mimeType });
+                    formData.append('file', blob, `audio.${format}`);
+                    formData.append('model', 'whisper-large-v3-turbo'); // Fast turbo model
+                    formData.append('response_format', 'json');
 
-                    // Convert buffer to blob
+                    const response = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
+                        method: 'POST',
+                        headers: {
+                            'Authorization': `Bearer ${this.groqApiKey}`,
+                        },
+                        body: formData,
+                    });
+
+                    if (!response.ok) {
+                        const errorText = await response.text();
+                        throw new Error(`Groq API error: ${response.status} - ${errorText}`);
+                    }
+
+                    const data = await response.json() as { text: string };
+                    const normalizedText = normalizeTranscriptText(data.text);
+
+                    return {
+                        text: normalizedText,
+                        confidence: 0.95, // Groq doesn't return confidence, assume high
+                    };
+                },
+                { maxRetries: 2 },
+                'groq-transcribe'
+            );
+
+            return result;
+        } catch (error) {
+            logger.error('Failed to transcribe with Groq:', error);
+            return { text: '', confidence: 0 };
+        }
+    }
+
+    /**
+     * Transcribe using local Whisper server
+     */
+    private async transcribeWithLocal(audioBuffer: Buffer, format: string): Promise<TranscriptionResult> {
+        try {
+            const result = await retryWithBackoff(
+                async () => {
+                    const formData = new FormData();
                     const blob = new Blob([audioBuffer], { type: `audio/${format}` });
                     formData.append('file', blob, `audio.${format}`);
                     formData.append('response_format', 'verbose_json');
@@ -72,8 +158,6 @@ export class LocalSpeechService {
                     }
 
                     const data = await response.json() as { text: string; confidence?: number };
-
-                    // Normalize the text if configured
                     const normalizedText = normalizeTranscriptText(data.text);
 
                     return {
@@ -87,15 +171,19 @@ export class LocalSpeechService {
 
             return result;
         } catch (error) {
-            logger.error('Failed to transcribe audio with local Whisper:', error);
+            logger.error('Failed to transcribe with local Whisper:', error);
             return { text: '', confidence: 0 };
         }
     }
 
     /**
-     * Check if the local speech service is available
+     * Check if the speech service is available
      */
     async healthCheck(): Promise<boolean> {
+        if (this.provider === 'groq') {
+            return !!this.groqApiKey;
+        }
+
         try {
             const response = await fetch(this.serviceUrl.replace('/transcribe', '/health'), {
                 method: 'GET',

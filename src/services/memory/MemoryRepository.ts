@@ -37,9 +37,21 @@ export class MemoryRepository {
         )
       `;
 
-            // Fetch the created record
+            // Fetch the created record (excluding embedding to avoid vector deserialization error)
             const memories = await this.db.$queryRaw<ServerMemoryData[]>`
-        SELECT * FROM server_memories WHERE "serverId" = ${data.serverId} ORDER BY "createdAt" DESC LIMIT 1
+        SELECT 
+          id::text,
+          "serverId",
+          type,
+          title,
+          content,
+          metadata,
+          "createdAt",
+          "updatedAt"
+        FROM server_memories 
+        WHERE "serverId" = ${data.serverId} 
+        ORDER BY "createdAt" DESC 
+        LIMIT 1
       `;
 
             return memories[0]!;
@@ -435,6 +447,167 @@ export class MemoryRepository {
         } catch (error) {
             logger.error('Failed to get recent session summaries:', error);
             return [];
+        }
+    }
+
+    /**
+     * Delete all memories for a server
+     */
+    async deleteAllServerMemories(serverId: string): Promise<number> {
+        try {
+            const result = await this.db.$executeRaw`
+                DELETE FROM server_memories WHERE "serverId" = ${serverId}
+            `;
+            return Number(result);
+        } catch (error) {
+            logger.error('Failed to delete server memories:', error);
+            throw error;
+        }
+    }
+
+    /**
+     * Delete all user profiles for a server
+     */
+    async deleteAllUserProfiles(serverId: string): Promise<number> {
+        try {
+            const result = await this.db.$executeRaw`
+                DELETE FROM user_profiles WHERE "serverId" = ${serverId}
+            `;
+            return Number(result);
+        } catch (error) {
+            logger.error('Failed to delete user profiles:', error);
+            throw error;
+        }
+    }
+
+    /**
+     * Delete all session summaries for a server
+     */
+    async deleteAllSessionSummaries(serverId: string): Promise<number> {
+        try {
+            const result = await this.db.$executeRaw`
+                DELETE FROM session_summaries WHERE "serverId" = ${serverId}
+            `;
+            return Number(result);
+        } catch (error) {
+            logger.error('Failed to delete session summaries:', error);
+            throw error;
+        }
+    }
+
+    /**
+     * Delete all transcript chunks for a server
+     */
+    async deleteAllTranscriptChunks(serverId: string): Promise<number> {
+        try {
+            const result = await this.db.transcriptChunk.deleteMany({
+                where: { serverId },
+            });
+            return result.count;
+        } catch (error) {
+            logger.error('Failed to delete transcript chunks:', error);
+            throw error;
+        }
+    }
+
+    /**
+     * Get all unique server IDs that have memories
+     */
+    async getAllServerIds(): Promise<string[]> {
+        try {
+            const result = await this.db.$queryRaw<{ serverId: string }[]>`
+                SELECT DISTINCT "serverId" FROM server_memories
+                UNION
+                SELECT DISTINCT "serverId" FROM user_profiles
+            `;
+            return result.map(r => r.serverId);
+        } catch (error) {
+            logger.error('Failed to get all server IDs:', error);
+            return [];
+        }
+    }
+
+    /**
+     * Update a server memory
+     */
+    async updateServerMemory(
+        id: string,
+        data: {
+            content?: string;
+            embedding?: number[];
+            metadata?: Record<string, unknown>;
+        }
+    ): Promise<void> {
+        try {
+            const updates: string[] = [];
+            if (data.content) updates.push(`content = '${data.content.replace(/'/g, "''")}'`);
+            if (data.embedding) updates.push(`embedding = '[${data.embedding.join(',')}]'::vector`);
+            if (data.metadata) updates.push(`metadata = '${JSON.stringify(data.metadata)}'::jsonb`);
+            updates.push(`"updatedAt" = NOW()`);
+
+            await this.db.$executeRawUnsafe(`
+                UPDATE server_memories 
+                SET ${updates.join(', ')}
+                WHERE id = '${id}'
+            `);
+        } catch (error) {
+            logger.error('Failed to update server memory:', error);
+            throw error;
+        }
+    }
+
+    /**
+     * Delete a single server memory
+     */
+    async deleteServerMemory(id: string): Promise<void> {
+        try {
+            await this.db.$executeRaw`
+                DELETE FROM server_memories WHERE id = ${id}::uuid
+            `;
+        } catch (error) {
+            logger.error('Failed to delete server memory:', error);
+            throw error;
+        }
+    }
+
+    /**
+     * Get all user profiles for a server
+     */
+    async getAllUserProfiles(serverId: string): Promise<UserProfileData[]> {
+        try {
+            const profiles = await this.db.$queryRaw<UserProfileData[]>`
+                SELECT 
+                    id::text,
+                    "serverId",
+                    "userId",
+                    "displayName",
+                    summary,
+                    tags,
+                    metadata,
+                    "lastUpdated",
+                    "createdAt"
+                FROM user_profiles
+                WHERE "serverId" = ${serverId}
+                ORDER BY "lastUpdated" DESC
+            `;
+            return profiles;
+        } catch (error) {
+            logger.error('Failed to get all user profiles:', error);
+            return [];
+        }
+    }
+
+    /**
+     * Delete a single user profile
+     */
+    async deleteUserProfile(id: string): Promise<void> {
+        try {
+            await this.db.$executeRaw`
+                DELETE FROM user_profiles WHERE id = ${id}::uuid
+            `;
+        } catch (error) {
+            logger.error('Failed to delete user profile:', error);
+            throw error;
         }
     }
 }

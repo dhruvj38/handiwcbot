@@ -18,7 +18,7 @@ model ServerMemory {
   type      String   // "event", "meme", "rule", "habit", "plan"
   title     String   // Short human-readable description
   content   String   @db.Text // Detailed text
-  embedding Unsupported("vector(1536)")? // Vector embedding for similarity search
+  embedding Unsupported("vector(768)")? // Vector embedding for similarity search
   metadata  Json?    // Additional structured data
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -36,7 +36,7 @@ model UserProfile {
   displayName String
   summary     String   @db.Text // Text description of personality, preferences, roles
   tags        String[] // Semantic tags: ["Valorant", "support main", "night owl"]
-  embedding   Unsupported("vector(1536)")? // Vector embedding for similarity search
+  embedding   Unsupported("vector(768)")? // Vector embedding for similarity search (Google text-embedding-004 = 768 dims)
   metadata    Json?    // Additional structured data
   lastUpdated DateTime @updatedAt
   createdAt   DateTime @default(now())
@@ -72,7 +72,7 @@ model SessionSummary {
   timeRangeStart DateTime
   timeRangeEnd   DateTime
   summaryText    String   @db.Text // High-level summary
-  embedding      Unsupported("vector(1536)")? // Vector embedding for similarity search
+  embedding      Unsupported("vector(768)")? // Vector embedding for similarity search (Google text-embedding-004 = 768 dims)
   metadata       Json?    // Structured data: events, plans, memes, user insights
   createdAt      DateTime @default(now())
 

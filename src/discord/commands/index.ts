@@ -101,4 +101,56 @@ export const commands = [
                         .setRequired(false)
                 )
         ),
+
+    new SlashCommandBuilder()
+        .setName('profile_server')
+        .setDescription('Build COMPLETE profiles by parsing ALL server data - no limits')
+        .addBooleanOption((option) =>
+            option
+                .setName('force')
+                .setDescription('Force fresh scan, ignoring cached data')
+                .setRequired(false)
+        ),
+
+    new SlashCommandBuilder()
+        .setName('speak')
+        .setDescription('Make the bot speak in voice chat (requires TTS enabled)')
+        .addStringOption((option) =>
+            option
+                .setName('text')
+                .setDescription('What to say in voice chat')
+                .setRequired(true)
+        ),
+
+    new SlashCommandBuilder()
+        .setName('train_vc')
+        .setDescription('Train personality from voice chat transcripts in a channel')
+        .addChannelOption((option) =>
+            option
+                .setName('channel')
+                .setDescription('Voice channel to train from')
+                .setRequired(true)
+        )
+        .addStringOption((option) =>
+            option
+                .setName('from')
+                .setDescription('Start time (ISO format or relative like "1h ago")')
+                .setRequired(true)
+        )
+        .addStringOption((option) =>
+            option
+                .setName('to')
+                .setDescription('End time (ISO format or relative like "now")')
+                .setRequired(false)
+        ),
+
+    new SlashCommandBuilder()
+        .setName('clear_memories')
+        .setDescription('⚠️ DELETE ALL memories, profiles, and transcripts for this server')
+        .addBooleanOption((option) =>
+            option
+                .setName('confirm')
+                .setDescription('Set to true to confirm deletion (this is irreversible!)')
+                .setRequired(true)
+        ),
 ].map((command) => command.toJSON());
