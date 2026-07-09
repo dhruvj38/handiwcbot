@@ -211,7 +211,7 @@ export class MemoryConsolidationService {
     /**
      * Merge a cluster of memories into one
      */
-    private async mergeMemoryCluster(_serverId: string, cluster: MemoryCluster): Promise<boolean> {
+    private async mergeMemoryCluster(serverId: string, cluster: MemoryCluster): Promise<boolean> {
         try {
             // Combine content
             const combinedContent = cluster.memories
@@ -225,8 +225,8 @@ ${combinedContent}
 
 Create a concise summary that captures all important information. Keep the same style/tone as the original content. Maximum 200 words.`;
 
-            const consolidatedContent = await this.aiService.quickPrompt(prompt);
-            const embedding = await this.aiService.generateEmbedding(consolidatedContent);
+            const consolidatedContent = await this.aiService.quickPrompt(serverId, prompt, 500);
+            const embedding = await this.aiService.generateEmbedding(serverId, consolidatedContent);
 
             // Keep the oldest memory and update it
             const oldestMemory = cluster.memories.reduce((oldest, m) => 
@@ -334,10 +334,10 @@ ${realtimeContent}
 
 Output a list of 3-5 key personality traits/patterns that are consistent and important. Be specific and actionable (e.g., "Uses 'fr' and 'ngl' frequently" not "Uses slang").`;
 
-            const keyTraits = await this.aiService.quickPrompt(prompt);
+            const keyTraits = await this.aiService.quickPrompt(serverId, prompt, 300);
             
             // Store as permanent personality memory
-            const embedding = await this.aiService.generateEmbedding(keyTraits);
+            const embedding = await this.aiService.generateEmbedding(serverId, keyTraits);
             await this.repository.createServerMemory({
                 serverId,
                 type: 'habit',

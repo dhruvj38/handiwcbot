@@ -3,10 +3,19 @@
  * Build slang, lore, social dynamics, and running jokes maps
  */
 
-import { GoogleGenAI } from '@google/genai';
+import { GoogleGenAI, HarmCategory, HarmBlockThreshold } from '@google/genai';
 import { config } from '../../config';
+import { modelRouter } from '../ai/ModelRouter';
 import { logger } from '../../utils/logger';
 import { RawMessage, SessionSummary, SlangEntry, LoreEntry, SocialDynamic, GlobalCultureMap } from './types';
+
+// Safety settings to allow processing of casual Discord conversations
+const PERMISSIVE_SAFETY_SETTINGS = [
+    { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.OFF },
+    { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.OFF },
+    { category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold: HarmBlockThreshold.OFF },
+    { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.OFF },
+];
 
 export class CultureMapper {
     private client: GoogleGenAI;
@@ -16,11 +25,12 @@ export class CultureMapper {
     }
 
     async buildCultureMaps(
+        guildId: string,
         summaries: SessionSummary[],
         messages: RawMessage[],
         members: { id: string; displayName: string; username: string; roles: string[] }[]
     ): Promise<GlobalCultureMap> {
-        const slangMap = await this.extractSlangMap(messages, summaries);
+        const slangMap = await this.extractSlangMap(guildId, messages, summaries);
         const loreMap = this.extractLoreMap(summaries);
         const socialMap = this.extractSocialDynamics(messages, members);
         const roleHierarchy = this.extractRoleHierarchy(members);
@@ -30,7 +40,7 @@ export class CultureMapper {
         return { slangMap, loreMap, socialMap, roleHierarchy, runningJokes, taboos, sacredCows };
     }
 
-    private async extractSlangMap(messages: RawMessage[], summaries: SessionSummary[]): Promise<SlangEntry[]> {
+    private async extractSlangMap(guildId: string, messages: RawMessage[], summaries: SessionSummary[]): Promise<SlangEntry[]> {
         // Collect slang from summaries
         const slangFromSummaries = new Set<string>();
         for (const s of summaries) {
@@ -42,13 +52,13 @@ export class CultureMapper {
         // Scan messages for frequent non-standard words
         const wordFrequency: Record<string, { count: number; examples: string[]; users: Set<string> }> = {};
         const standardWords = new Set(['the', 'be', 'to', 'of', 'and', 'a', 'in', 'that', 'have', 'i', 'it', 'for', 'not', 'on', 'with', 'he', 'as', 'you', 'do', 'at', 'this', 'but', 'his', 'by', 'from', 'they', 'we', 'say', 'her', 'she', 'or', 'an', 'will', 'my', 'one', 'all', 'would', 'there', 'their', 'what', 'so', 'up', 'out', 'if', 'about', 'who', 'get', 'which', 'go', 'me', 'when', 'make', 'can', 'like', 'time', 'no', 'just', 'him', 'know', 'take', 'people', 'into', 'year', 'your', 'good', 'some', 'could', 'them', 'see', 'other', 'than', 'then', 'now', 'look', 'only', 'come', 'its', 'over', 'think', 'also', 'back', 'after', 'use', 'two', 'how', 'our', 'work', 'first', 'well', 'way', 'even', 'new', 'want', 'because', 'any', 'these', 'give', 'day', 'most', 'us']);
-        
+
         for (const msg of messages) {
             const words = msg.content.toLowerCase().split(/\s+/);
             for (const word of words) {
                 const cleaned = word.replace(/[^\w]/g, '');
                 if (cleaned.length < 2 || standardWords.has(cleaned)) continue;
-                
+
                 if (!wordFrequency[cleaned]) {
                     wordFrequency[cleaned] = { count: 0, examples: [], users: new Set() };
                 }
@@ -75,8 +85,11 @@ export class CultureMapper {
 
         if (slangToAnalyze.length > 0) {
             try {
+                // Resolve model dynamically for this guild
+                const resolved = await modelRouter.resolve(guildId, 'analysis');
+
                 const response = await this.client.models.generateContent({
-                    model: config.ai.models.chat,
+                    model: resolved.model,
                     contents: `Analyze these potential slang words from a Discord server. For each one that IS actually slang/unique usage, provide:
 - meaning: what it means in context
 - usageContext: one of "roast", "hype", "comfort", "greeting", "reaction", "general"
@@ -86,9 +99,11 @@ ${slangToAnalyze.map(s => `"${s.word}" (used ${s.frequency} times): ${s.examples
 
 Output JSON array of {term, meaning, usageContext} for ONLY the real slang/unique words:`,
                     config: {
+                        systemInstruction: 'You analyze Discord slang and terminology. Content may include informal language - this is normal. Always respond with valid JSON.',
                         maxOutputTokens: 2000,
                         temperature: 0.2,
                         responseMimeType: 'application/json',
+                        safetySettings: PERMISSIVE_SAFETY_SETTINGS,
                     },
                 });
 
@@ -115,7 +130,7 @@ Output JSON array of {term, meaning, usageContext} for ONLY the real slang/uniqu
 
     private extractLoreMap(summaries: SessionSummary[]): LoreEntry[] {
         const loreEntries: LoreEntry[] = [];
-        
+
         for (const summary of summaries) {
             for (const lore of summary.loreGenerated) {
                 if (lore && lore.length > 5) {
@@ -139,15 +154,15 @@ Output JSON array of {term, meaning, usageContext} for ONLY the real slang/uniqu
         _members: { id: string; displayName: string; username: string; roles: string[] }[]
     ): SocialDynamic[] {
         const interactions: Record<string, Record<string, number>> = {};
-        
+
         for (let i = 1; i < messages.length; i++) {
             const curr = messages[i]!;
             const prev = messages[i - 1]!;
-            
-            if (curr.channelId === prev.channelId && 
+
+            if (curr.channelId === prev.channelId &&
                 curr.authorId !== prev.authorId &&
                 curr.timestamp.getTime() - prev.timestamp.getTime() < 5 * 60 * 1000) {
-                
+
                 if (!interactions[curr.authorName]) {
                     interactions[curr.authorName] = {};
                 }
@@ -160,16 +175,16 @@ Output JSON array of {term, meaning, usageContext} for ONLY the real slang/uniqu
 
         const dynamics: SocialDynamic[] = [];
         const seen = new Set<string>();
-        
+
         for (const [user1, targets] of Object.entries(interactions)) {
             for (const [user2, count] of Object.entries(targets)) {
                 const pairKey = [user1, user2].sort().join('|');
                 if (seen.has(pairKey)) continue;
                 seen.add(pairKey);
-                
+
                 const reverseCount = interactions[user2]?.[user1] || 0;
                 const totalInteractions = count + reverseCount;
-                
+
                 if (totalInteractions > 20) {
                     dynamics.push({
                         relationship: `${user1} ↔ ${user2}`,
@@ -189,7 +204,7 @@ Output JSON array of {term, meaning, usageContext} for ONLY the real slang/uniqu
         members: { id: string; displayName: string; username: string; roles: string[] }[]
     ): GlobalCultureMap['roleHierarchy'] {
         const roleCounts: Record<string, number> = {};
-        
+
         for (const member of members) {
             for (const role of member.roles) {
                 roleCounts[role] = (roleCounts[role] || 0) + 1;
@@ -212,7 +227,7 @@ Output JSON array of {term, meaning, usageContext} for ONLY the real slang/uniqu
         _summaries: SessionSummary[]
     ): GlobalCultureMap['runningJokes'] {
         const phraseFrequency: Record<string, number> = {};
-        
+
         for (const msg of messages) {
             if (msg.content.length > 5 && msg.content.length < 50) {
                 const phrase = msg.content.toLowerCase().trim();

@@ -1,0 +1,411 @@
+'use client'
+
+import { useParams } from 'next/navigation'
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { api, GuildConfig } from '@/lib/api'
+import { useState, useEffect } from 'react'
+import { 
+  Loader2, Save, Hash, MessageSquare, Database, 
+  Wifi, WifiOff, CheckCircle2, AlertCircle, Trash2,
+  Settings2, Bell
+} from 'lucide-react'
+import { useGuildConfigWebSocket } from '@/lib/useConfigWebSocket'
+
+interface ConfigResponse {
+  config: GuildConfig
+}
+
+interface DiscordChannel {
+  id: string
+  name: string
+  type: 'text' | 'announcement'
+  parentId: string | null
+}
+
+interface ChannelsResponse {
+  channels: DiscordChannel[]
+  categories: Record<string, string>
+}
+
+export default function SettingsPage() {
+  const { guildId } = useParams()
+  const queryClient = useQueryClient()
+  const [saveSuccess, setSaveSuccess] = useState(false)
+  
+  const [settings, setSettings] = useState({
+    allowedChannelIds: [] as string[],
+    logChannelId: '' as string,
+    memoryRetentionDays: 30,
+    maxMemoriesPerUser: 100,
+    memoryRetrievalLimit: 10,
+    maxContextMessages: 50,
+    botPrefix: '!',
+  })
+  
+  const [newChannelId, setNewChannelId] = useState('')
+
+  // WebSocket for real-time updates
+  const { isConnected } = useGuildConfigWebSocket(guildId as string, {
+    onConfigChange: (event) => {
+      console.log('[Settings] Real-time config update:', event.field, '=', event.newValue)
+      if (event.field && event.newValue !== undefined) {
+        const field = event.field as keyof typeof settings
+        if (field in settings) {
+          setSettings(prev => ({ ...prev, [field]: event.newValue }))
+        }
+      }
+    },
+  })
+
+  // Fetch guild config
+  const { data, isLoading } = useQuery<ConfigResponse>({
+    queryKey: ['guild-config', guildId],
+    queryFn: () => api.get(`/api/guilds/${guildId}/config`),
+    refetchInterval: 30000,
+  })
+
+  // Fetch Discord channels
+  const { data: channelsData, isLoading: channelsLoading } = useQuery<ChannelsResponse>({
+    queryKey: ['guild-channels', guildId],
+    queryFn: () => api.get(`/api/guilds/${guildId}/channels`),
+    staleTime: 60000,
+  })
+
+  useEffect(() => {
+    if (data?.config) {
+      setSettings({
+        allowedChannelIds: data.config.allowedChannelIds || [],
+        logChannelId: data.config.logChannelId || '',
+        memoryRetentionDays: data.config.memoryRetentionDays,
+        maxMemoriesPerUser: data.config.maxMemoriesPerUser,
+        memoryRetrievalLimit: data.config.memoryRetrievalLimit,
+        maxContextMessages: data.config.maxContextMessages,
+        botPrefix: data.config.botPrefix,
+      })
+    }
+  }, [data])
+
+  const updateMutation = useMutation({
+    mutationFn: (updates: Partial<GuildConfig>) =>
+      api.patch(`/api/guilds/${guildId}/config`, updates),
+    onSuccess: () => {
+      console.log('[Settings] Config saved successfully')
+      queryClient.invalidateQueries({ queryKey: ['guild-config', guildId] })
+      setSaveSuccess(true)
+      setTimeout(() => setSaveSuccess(false), 3000)
+    },
+    onError: (error) => {
+      console.error('[Settings] Failed to save config:', error)
+    },
+  })
+
+  const handleSave = () => {
+    console.log('[Settings] Saving settings:', settings)
+    updateMutation.mutate({
+      allowedChannelIds: settings.allowedChannelIds,
+      logChannelId: settings.logChannelId || null,
+      memoryRetentionDays: settings.memoryRetentionDays,
+      maxMemoriesPerUser: settings.maxMemoriesPerUser,
+      memoryRetrievalLimit: settings.memoryRetrievalLimit,
+      maxContextMessages: settings.maxContextMessages,
+      botPrefix: settings.botPrefix,
+    })
+  }
+
+  const handleAddChannel = () => {
+    if (newChannelId && !settings.allowedChannelIds.includes(newChannelId)) {
+      const updated = [...settings.allowedChannelIds, newChannelId]
+      setSettings({ ...settings, allowedChannelIds: updated })
+      setNewChannelId('')
+    }
+  }
+
+  const handleRemoveChannel = (channelId: string) => {
+    const updated = settings.allowedChannelIds.filter(id => id !== channelId)
+    setSettings({ ...settings, allowedChannelIds: updated })
+  }
+
+  const getChannelName = (channelId: string): string => {
+    const channel = channelsData?.channels.find(c => c.id === channelId)
+    return channel ? `#${channel.name}` : channelId
+  }
+
+  const hasChanges = data?.config && (
+    JSON.stringify(settings.allowedChannelIds) !== JSON.stringify(data.config.allowedChannelIds || []) ||
+    (settings.logChannelId || '') !== (data.config.logChannelId || '') ||
+    settings.memoryRetentionDays !== data.config.memoryRetentionDays ||
+    settings.maxMemoriesPerUser !== data.config.maxMemoriesPerUser ||
+    settings.memoryRetrievalLimit !== data.config.memoryRetrievalLimit ||
+    settings.maxContextMessages !== data.config.maxContextMessages ||
+    settings.botPrefix !== data.config.botPrefix
+  )
+
+  if (isLoading) {
+    return (
+      <div className="flex h-64 items-center justify-center">
+        <Loader2 className="h-8 w-8 animate-spin text-primary" />
+      </div>
+    )
+  }
+
+  return (
+    <div className="space-y-8">
+      {/* Header */}
+      <div className="flex items-center justify-between">
+        <div>
+          <div className="flex items-center gap-2">
+            <h1 className="text-2xl font-bold">Server Settings</h1>
+            <span title={isConnected ? "Real-time sync active" : "Real-time sync disconnected"}>
+              {isConnected ? (
+                <Wifi className="h-4 w-4 text-green-500" />
+              ) : (
+                <WifiOff className="h-4 w-4 text-zinc-500" />
+              )}
+            </span>
+          </div>
+          <p className="text-muted-foreground">Configure bot behavior, channels, and memory</p>
+        </div>
+        <button
+          onClick={handleSave}
+          disabled={updateMutation.isPending || !hasChanges}
+          className="flex items-center gap-2 rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50 transition-all"
+        >
+          {updateMutation.isPending ? (
+            <Loader2 className="h-4 w-4 animate-spin" />
+          ) : saveSuccess ? (
+            <CheckCircle2 className="h-4 w-4" />
+          ) : (
+            <Save className="h-4 w-4" />
+          )}
+          {updateMutation.isPending ? 'Saving...' : saveSuccess ? 'Saved!' : 'Save Changes'}
+        </button>
+      </div>
+
+      {/* Success Banner */}
+      {saveSuccess && (
+        <div className="flex items-center gap-2 rounded-lg border border-green-500/20 bg-green-500/10 p-4 text-green-400">
+          <CheckCircle2 className="h-5 w-5" />
+          <span>Settings saved successfully! Changes are now active.</span>
+        </div>
+      )}
+
+      <div className="grid gap-6 lg:grid-cols-2">
+        {/* Discord Log Channel */}
+        <div className="rounded-xl border border-zinc-800 bg-zinc-900/50 p-6">
+          <div className="mb-4 flex items-center gap-2">
+            <Bell className="h-5 w-5 text-yellow-500" />
+            <h2 className="text-lg font-semibold">Discord Log Channel</h2>
+          </div>
+          <p className="mb-4 text-sm text-muted-foreground">
+            Select a channel where the bot will send activity logs and notifications.
+          </p>
+
+          {channelsLoading ? (
+            <div className="flex items-center gap-2 text-muted-foreground">
+              <Loader2 className="h-4 w-4 animate-spin" />
+              <span className="text-sm">Loading channels...</span>
+            </div>
+          ) : (
+            <select
+              value={settings.logChannelId}
+              onChange={(e) => setSettings({ ...settings, logChannelId: e.target.value })}
+              className="w-full rounded-lg border border-zinc-700 bg-zinc-800 px-3 py-2.5 text-sm focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary"
+            >
+              <option value="">No log channel (disabled)</option>
+              {channelsData?.channels.map((channel) => (
+                <option key={channel.id} value={channel.id}>
+                  #{channel.name} {channel.type === 'announcement' ? '(Announcement)' : ''}
+                </option>
+              ))}
+            </select>
+          )}
+          
+          {settings.logChannelId && (
+            <div className="mt-3 flex items-center gap-2 text-sm text-green-400">
+              <CheckCircle2 className="h-4 w-4" />
+              <span>Logs will be sent to {getChannelName(settings.logChannelId)}</span>
+            </div>
+          )}
+        </div>
+
+        {/* Bot Behavior */}
+        <div className="rounded-xl border border-zinc-800 bg-zinc-900/50 p-6">
+          <div className="mb-4 flex items-center gap-2">
+            <Settings2 className="h-5 w-5 text-blue-500" />
+            <h2 className="text-lg font-semibold">Bot Behavior</h2>
+          </div>
+          
+          <div className="space-y-4">
+            <div>
+              <label className="mb-1 block text-sm text-muted-foreground">Command Prefix</label>
+              <input
+                type="text"
+                value={settings.botPrefix}
+                onChange={(e) => setSettings({ ...settings, botPrefix: e.target.value || '!' })}
+                maxLength={5}
+                className="w-full rounded-lg border border-zinc-700 bg-zinc-800 px-3 py-2 text-sm focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary"
+              />
+              <p className="mt-1 text-xs text-muted-foreground">
+                Character(s) before commands, e.g., {settings.botPrefix}help
+              </p>
+            </div>
+            
+            <div>
+              <label className="mb-1 block text-sm text-muted-foreground">Context Messages</label>
+              <input
+                type="number"
+                min="10"
+                max="100"
+                value={settings.maxContextMessages}
+                onChange={(e) => setSettings({ ...settings, maxContextMessages: parseInt(e.target.value) || 50 })}
+                className="w-full rounded-lg border border-zinc-700 bg-zinc-800 px-3 py-2 text-sm focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary"
+              />
+              <p className="mt-1 text-xs text-muted-foreground">
+                Recent messages included for AI context
+              </p>
+            </div>
+          </div>
+        </div>
+
+        {/* Channel Restrictions */}
+        <div className="rounded-xl border border-zinc-800 bg-zinc-900/50 p-6">
+          <div className="mb-4 flex items-center gap-2">
+            <Hash className="h-5 w-5 text-primary" />
+            <h2 className="text-lg font-semibold">Allowed Channels</h2>
+          </div>
+          <p className="mb-4 text-sm text-muted-foreground">
+            If set, the bot will only respond in these channels. Leave empty to allow all channels.
+          </p>
+
+          <div className="mb-4 flex gap-2">
+            {channelsLoading ? (
+              <div className="flex-1 flex items-center gap-2 text-muted-foreground">
+                <Loader2 className="h-4 w-4 animate-spin" />
+                <span className="text-sm">Loading...</span>
+              </div>
+            ) : (
+              <select
+                value={newChannelId}
+                onChange={(e) => setNewChannelId(e.target.value)}
+                className="flex-1 rounded-lg border border-zinc-700 bg-zinc-800 px-3 py-2 text-sm focus:border-primary focus:outline-none"
+              >
+                <option value="">Select a channel...</option>
+                {channelsData?.channels
+                  .filter(c => !settings.allowedChannelIds.includes(c.id))
+                  .map((channel) => (
+                    <option key={channel.id} value={channel.id}>
+                      #{channel.name}
+                    </option>
+                  ))}
+              </select>
+            )}
+            <button
+              onClick={handleAddChannel}
+              disabled={!newChannelId}
+              className="rounded-lg bg-primary px-4 py-2 text-sm font-medium text-white hover:bg-primary/90 disabled:opacity-50"
+            >
+              Add
+            </button>
+          </div>
+
+          {settings.allowedChannelIds.length > 0 ? (
+            <div className="space-y-2">
+              {settings.allowedChannelIds.map((channelId) => (
+                <div
+                  key={channelId}
+                  className="flex items-center justify-between rounded-lg border border-zinc-700/50 bg-zinc-800/50 px-3 py-2"
+                >
+                  <div className="flex items-center gap-2">
+                    <Hash className="h-4 w-4 text-muted-foreground" />
+                    <span className="text-sm">{getChannelName(channelId)}</span>
+                  </div>
+                  <button
+                    onClick={() => handleRemoveChannel(channelId)}
+                    className="text-red-400 hover:text-red-300 p-1 rounded hover:bg-red-500/10 transition-colors"
+                  >
+                    <Trash2 className="h-4 w-4" />
+                  </button>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="rounded-lg border border-dashed border-zinc-700 p-4 text-center">
+              <p className="text-sm text-zinc-500">No restrictions — bot responds in all channels</p>
+            </div>
+          )}
+        </div>
+
+        {/* Memory Settings */}
+        <div className="rounded-xl border border-zinc-800 bg-zinc-900/50 p-6">
+          <div className="mb-4 flex items-center gap-2">
+            <Database className="h-5 w-5 text-purple-500" />
+            <h2 className="text-lg font-semibold">Memory Settings</h2>
+          </div>
+
+          <div className="space-y-5">
+            <div>
+              <div className="mb-2 flex items-center justify-between">
+                <label className="text-sm">Memory Retention</label>
+                <span className="text-sm font-medium text-primary">{settings.memoryRetentionDays} days</span>
+              </div>
+              <input
+                type="range"
+                min="7"
+                max="365"
+                value={settings.memoryRetentionDays}
+                onChange={(e) => setSettings({ ...settings, memoryRetentionDays: parseInt(e.target.value) })}
+                className="w-full accent-primary"
+              />
+              <div className="flex justify-between text-xs text-muted-foreground mt-1">
+                <span>7 days</span>
+                <span>365 days</span>
+              </div>
+            </div>
+
+            <div>
+              <div className="mb-2 flex items-center justify-between">
+                <label className="text-sm">Max Memories Per User</label>
+                <span className="text-sm font-medium text-primary">{settings.maxMemoriesPerUser}</span>
+              </div>
+              <input
+                type="range"
+                min="10"
+                max="500"
+                value={settings.maxMemoriesPerUser}
+                onChange={(e) => setSettings({ ...settings, maxMemoriesPerUser: parseInt(e.target.value) })}
+                className="w-full accent-primary"
+              />
+              <div className="flex justify-between text-xs text-muted-foreground mt-1">
+                <span>10</span>
+                <span>500</span>
+              </div>
+            </div>
+            
+            <div>
+              <label className="mb-1 block text-sm text-muted-foreground">Memory Retrieval Limit</label>
+              <input
+                type="number"
+                min="1"
+                max="50"
+                value={settings.memoryRetrievalLimit}
+                onChange={(e) => setSettings({ ...settings, memoryRetrievalLimit: parseInt(e.target.value) || 10 })}
+                className="w-full rounded-lg border border-zinc-700 bg-zinc-800 px-3 py-2 text-sm focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary"
+              />
+              <p className="mt-1 text-xs text-muted-foreground">
+                Max memories to include in AI context
+              </p>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Info Card */}
+      <div className="rounded-xl border border-blue-500/20 bg-blue-500/10 p-4">
+        <h3 className="font-medium text-blue-400">Real-time Configuration</h3>
+        <p className="mt-1 text-sm text-blue-300/80">
+          All settings take effect immediately without restarting the bot. Changes are synced across all dashboard sessions in real-time.
+        </p>
+      </div>
+    </div>
+  )
+}

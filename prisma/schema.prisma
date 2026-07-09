@@ -30,21 +30,43 @@ model ServerMemory {
 
 // User profiles: personality, preferences, roles, recurring jokes
 model UserProfile {
-  id          String   @id @default(uuid())
-  serverId    String   // Discord guild ID
-  userId      String   // Discord user ID
-  displayName String
-  summary     String   @db.Text // Text description of personality, preferences, roles
-  tags        String[] // Semantic tags: ["Valorant", "support main", "night owl"]
-  embedding   Unsupported("vector(768)")? // Vector embedding for similarity search (Google text-embedding-004 = 768 dims)
-  metadata    Json?    // Additional structured data
-  lastUpdated DateTime @updatedAt
-  createdAt   DateTime @default(now())
+  id                String   @id @default(uuid())
+  serverId          String   // Discord guild ID
+  userId            String   // Discord user ID
+  displayName       String
+  preferredNickname String?  // User's preferred nickname (bot learns/user sets)
+  summary           String   @db.Text // Text description of personality, preferences, roles
+  tags              String[] // Semantic tags: ["Valorant", "support main", "night owl"]
+  embedding         Unsupported("vector(768)")? // Vector embedding for similarity search (Google text-embedding-004 = 768 dims)
+  metadata          Json?    // Additional structured data (includes nicknameSource: 'user_set' | 'llm_inferred' | 'admin_set')
+  lastUpdated       DateTime @updatedAt
+  createdAt         DateTime @default(now())
 
   @@unique([serverId, userId])
   @@index([serverId])
   @@index([userId])
   @@map("user_profiles")
+}
+
+// Voice session transcripts - groups transcript chunks by full VC session
+model VoiceSessionTranscript {
+  id               String   @id @default(uuid())
+  serverId         String   // Discord guild ID
+  channelId        String   // Voice channel ID
+  channelName      String?  // Voice channel name for display
+  startedAt        DateTime
+  endedAt          DateTime?
+  isActive         Boolean  @default(true)
+  participantCount Int      @default(0)
+  totalMessages    Int      @default(0)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  transcriptChunks TranscriptChunk[]
+
+  @@index([serverId, startedAt])
+  @@index([serverId, isActive])
+  @@map("voice_session_transcripts")
 }
 
 // Raw voice transcripts
@@ -53,14 +75,20 @@ model TranscriptChunk {
   serverId  String    // Discord guild ID
   channelId String    // Voice channel ID
   userId    String?   // Speaker Discord user ID (nullable if unknown)
+  userName  String?   // Speaker display name
   startedAt DateTime
   endedAt   DateTime
   rawText   String    @db.Text // Transcribed text
   metadata  Json?     // Additional data like audio quality, confidence
   createdAt DateTime  @default(now())
 
+  // Link to voice session (nullable for backwards compatibility)
+  sessionId String?
+  session   VoiceSessionTranscript? @relation(fields: [sessionId], references: [id])
+
   @@index([serverId, channelId, startedAt])
   @@index([userId])
+  @@index([sessionId])
   @@map("transcript_chunks")
 }
 
@@ -78,4 +106,250 @@ model SessionSummary {
 
   @@index([serverId, channelId, timeRangeStart])
   @@map("session_summaries")
+}
+
+model AiInteraction {
+  id           String   @id @default(uuid())
+  guildId      String
+  channelId    String?
+  userId       String?
+  userName     String?
+  messageId    String?
+  botMessageId String?
+  provider     String
+  model        String
+  type         String
+  userMessage  String   @db.Text
+  botResponse  String   @db.Text
+  rating       String?
+  feedbackText String?  @db.Text
+  tags         String[]
+  metadata     Json?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@index([guildId, createdAt])
+  @@index([guildId, channelId, createdAt])
+  @@map("ai_interactions")
+}
+
+// ═══════════════════════════════════════════════════════════════
+// DASHBOARD & CONFIGURATION MODELS
+// ═══════════════════════════════════════════════════════════════
+
+// Dashboard user sessions
+model DashboardSession {
+  id           String   @id @default(uuid())
+  discordId    String   @unique // Discord user ID
+  username     String
+  avatar       String?
+  accessToken  String   // Discord OAuth access token
+  refreshToken String?  // Discord OAuth refresh token
+  expiresAt    DateTime
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@index([discordId])
+  @@map("dashboard_sessions")
+}
+
+// Per-guild configuration
+model GuildConfig {
+  id        String   @id @default(uuid())
+  guildId   String   @unique // Discord guild ID
+  guildName String
+  guildIcon String?
+  
+  // ═══════════════════════════════════════════════════════════════
+  // FEATURE TOGGLES
+  // ═══════════════════════════════════════════════════════════════
+  learningEnabled     Boolean @default(true)
+  voiceEnabled        Boolean @default(true)
+  ttsEnabled          Boolean @default(false)
+  autoJoinEnabled     Boolean @default(true)
+  chimeInEnabled      Boolean @default(true)
+  
+  // ═══════════════════════════════════════════════════════════════
+  // AI SETTINGS (runtime configurable)
+  // ═══════════════════════════════════════════════════════════════
+  aiModel             String  @default("gemini-2.0-flash")
+  aiModelAnalysis     String  @default("gemini-2.5-pro")
+  aiModelEmbeddings   String  @default("text-embedding-004")
+  aiChatProvider      String  @default("google")      // 'google' | 'openai'
+  aiAnalysisProvider  String  @default("google")      // 'google' | 'openai'
+  aiEmbeddingsProvider String @default("google")      // 'google' | 'openai'
+  aiTemperature       Float   @default(0.7)
+  aiMaxTokens         Int     @default(2000)
+  
+  // ═══════════════════════════════════════════════════════════════
+  // VOICE CHAT SETTINGS (runtime configurable)
+  // ═══════════════════════════════════════════════════════════════
+  ttsVoice            String  @default("JBFqnCBsd6RMkjVDRZzb")
+  ttsModel            String  @default("eleven_flash_v2_5")
+  minMembersToJoin    Int     @default(2)
+  chimeInChance       Float   @default(0.15)
+  minSecondsBetweenChimes Int @default(60)
+  maxVoiceResponseLength  Int @default(200)
+  voiceChunkDurationMs    Int @default(30000)
+  voiceSummaryIntervalMs  Int @default(300000)
+  
+  // ═══════════════════════════════════════════════════════════════
+  // LEARNING SETTINGS (runtime configurable)
+  // ═══════════════════════════════════════════════════════════════
+  learningBatchSize           Int @default(20)
+  learningBatchTimeoutMs      Int @default(60000)
+  learningPersonalityUpdateMs Int @default(300000)
+  learningConsolidationMs     Int @default(3600000)
+  
+  // ═══════════════════════════════════════════════════════════════
+  // MEMORY SETTINGS
+  // ═══════════════════════════════════════════════════════════════
+  memoryRetentionDays Int     @default(30)
+  maxMemoriesPerUser  Int     @default(100)
+  memoryRetrievalLimit Int    @default(10)
+  maxContextMessages  Int     @default(50)
+  
+  // ═══════════════════════════════════════════════════════════════
+  // BOT BEHAVIOR
+  // ═══════════════════════════════════════════════════════════════
+  botPrefix           String  @default("!")
+  
+  // Personality (JSON blob for flexibility)
+  personalityOverrides Json?
+  
+  // Allowed channels (empty = all)
+  allowedChannelIds   String[]
+  logChannelId        String?
+  
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("guild_configs")
+}
+
+// Audit log for config changes
+model ConfigAuditLog {
+  id          String   @id @default(uuid())
+  guildId     String
+  actorId     String   // Discord user who made the change
+  actorName   String
+  changeType  String   // "update", "reset", "toggle"
+  field       String   // Which field changed
+  oldValue    String?  @db.Text
+  newValue    String?  @db.Text
+  createdAt   DateTime @default(now())
+
+  @@index([guildId])
+  @@index([createdAt])
+  @@map("config_audit_logs")
+}
+
+// Event/activity logs
+model ActivityLog {
+  id            String   @id @default(uuid())
+  guildId       String
+  channelId     String?
+  userId        String?
+  userName      String?
+  
+  type          String   // "message", "command", "voice_join", "voice_leave", "ai_request", "ai_response", "tts", "stt", "error", "learning"
+  severity      String   @default("info") // "debug", "info", "warn", "error"
+  
+  summary       String   @db.Text
+  metadata      Json?    // Flexible extra data
+  
+  // For AI calls
+  model         String?
+  promptTokens  Int?
+  outputTokens  Int?
+  latencyMs     Int?
+  costUsd       Float?
+  
+  // For errors
+  errorCode     String?
+  stackTrace    String?  @db.Text
+  
+  correlationId String?  // Link related events
+  
+  createdAt     DateTime @default(now())
+
+  @@index([guildId, createdAt])
+  @@index([type])
+  @@index([severity])
+  @@index([correlationId])
+  @@map("activity_logs")
+}
+
+// Aggregated metrics (hourly snapshots)
+model MetricsSnapshot {
+  id              String   @id @default(uuid())
+  guildId         String
+  periodStart     DateTime
+  periodEnd       DateTime
+  
+  messagesCount   Int      @default(0)
+  commandsCount   Int      @default(0)
+  voiceMinutes    Float    @default(0)
+  aiRequestsCount Int      @default(0)
+  
+  promptTokens    Int      @default(0)
+  outputTokens    Int      @default(0)
+  estimatedCostUsd Float   @default(0)
+  
+  errorsCount     Int      @default(0)
+  avgLatencyMs    Float?
+  
+  createdAt       DateTime @default(now())
+
+  @@unique([guildId, periodStart])
+  @@index([guildId, periodStart])
+  @@map("metrics_snapshots")
+}
+
+// ═══════════════════════════════════════════════════════════════
+// PROMPT EDITING SYSTEM
+// ═══════════════════════════════════════════════════════════════
+
+// Tracks prompt history for editing reference
+model PromptLog {
+  id            String   @id @default(uuid())
+  guildId       String
+  channelId     String   // Where the original message was sent
+  messageId     String?  // Discord message ID (for the original user message)
+  logMessageId  String?  // Discord message ID in bot-logs channel
+  
+  systemPrompt  String   @db.Text
+  userPrompt    String   @db.Text
+  model         String
+  provider      String
+  
+  // Parsed sections for targeted editing
+  sections      Json     // { "core_identity": "...", "slang": "...", etc. }
+  
+  createdAt     DateTime @default(now())
+  
+  @@index([guildId, createdAt])
+  @@index([logMessageId])
+  @@map("prompt_logs")
+}
+
+// Stores permanent section overrides that apply to future prompts
+model PromptOverride {
+  id            String   @id @default(uuid())
+  guildId       String
+  section       String   // "core_identity", "slang", "forbidden_phrases", etc.
+  originalText  String   @db.Text
+  overrideText  String   @db.Text
+  
+  // AI-generated learning from the change
+  learnedRule   String?  @db.Text
+  
+  isActive      Boolean  @default(true)
+  createdBy     String   // Discord user ID who made edit
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  
+  @@index([guildId, section])
+  @@index([guildId, isActive])
+  @@map("prompt_overrides")
 }

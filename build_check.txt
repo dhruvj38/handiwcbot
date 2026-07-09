@@ -1,5 +1,0 @@
-src/discord/commands/CommandHandler.ts(1,66): error TS6133: 'TextChannel' is declared but its value is never read.
-src/index.ts(1,1): error TS6133: 'config' is declared but its value is never read.
-src/services/memory/MemoryService.ts(6,5): error TS6133: 'ChatContext' is declared but its value is never read.
-src/services/speech/SpeechService.ts(18,64): error TS6133: 'match' is declared but its value is never read.
-src/types/index.ts(1,1): error TS6133: 'Message' is declared but its value is never read.

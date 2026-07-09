@@ -5,4 +5,5 @@
 
 export { ServerProfiler } from './ServerProfiler';
 export { MessageCache, CachedMessage, CacheMetadata } from './MessageCache';
+export { ChannelClassifier, ClassifiedChannel, ChannelCategory } from './ChannelClassifier';
 export * from './types';

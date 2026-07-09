@@ -4,28 +4,43 @@
  * Extracts EXACT typing style, speech patterns, and personality
  */
 
-import { GoogleGenAI } from '@google/genai';
+import { GoogleGenAI, HarmCategory, HarmBlockThreshold } from '@google/genai';
 import { config } from '../../config';
+import { modelRouter } from '../ai/ModelRouter';
 import { logger } from '../../utils/logger';
 import { sleep } from '../../utils/helpers';
 import { RawMessage, SessionSummary, ServerBible, ProgressCallback } from './types';
 
+// Safety settings to allow processing of casual Discord conversations
+const PERMISSIVE_SAFETY_SETTINGS = [
+    { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.OFF },
+    { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.OFF },
+    { category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold: HarmBlockThreshold.OFF },
+    { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.OFF },
+];
+
 export class UserProfileBuilder {
     private client: GoogleGenAI;
-    private proModel: string;
-    
+
     // Rate limiting to avoid 429s
-    private readonly PARALLEL_LIMIT = 2; // Very low - user profiles are heavy
-    private readonly DELAY_BETWEEN_BATCHES_MS = 3000; // 3s between batches
-    private readonly MAX_RETRIES = 5;
-    private readonly BASE_RETRY_DELAY_MS = 5000;
+    private readonly PARALLEL_LIMIT = 3; // Moderate parallelism
+    private readonly DELAY_BETWEEN_BATCHES_MS = 2000; // 2s between batches
+    private readonly MAX_RETRIES = 3; // Reduced retries since we have fallback
+    private readonly BASE_RETRY_DELAY_MS = 3000;
+
+    // Progress tracking
+    private processedCount = 0;
+    private aiSuccessCount = 0;
+    private fallbackCount = 0;
+    private totalUsers = 0;
 
     constructor() {
         this.client = new GoogleGenAI({ apiKey: config.ai.apiKey });
-        this.proModel = config.ai.models.analysis;
+        // this.proModel is now resolved dynamically per guild
     }
 
     async build(
+        guildId: string,
         messages: RawMessage[],
         members: { id: string; displayName: string; username: string; roles: string[] }[],
         _summaries: SessionSummary[],
@@ -50,25 +65,39 @@ export class UserProfileBuilder {
             .sort((a, b) => b[1].length - a[1].length)
             .slice(0, 30);
 
-        await updateStatus(`  👥 Analyzing ${topUsers.length} top users with AI...`);
+        // Reset progress tracking
+        this.processedCount = 0;
+        this.aiSuccessCount = 0;
+        this.fallbackCount = 0;
+        this.totalUsers = topUsers.length;
+
+        await updateStatus(this.formatProgress());
+
+        // Resolve model dynamically for this guild
+        const resolved = await modelRouter.resolve(guildId, 'analysis');
+        const proModel = resolved.model;
+
+        logger.info(`🔬 [Analysis] Building user profiles using model: ${proModel}`);
 
         const profiles: ServerBible['userProfiles'] = [];
 
-        // Process users in parallel batches - LOW parallelism to avoid 429s
+        // Process users in parallel batches
         for (let i = 0; i < topUsers.length; i += this.PARALLEL_LIMIT) {
             const batch = topUsers.slice(i, i + this.PARALLEL_LIMIT);
-            
+
             const batchPromises = batch.map(async ([userId, userMsgs]) => {
                 const member = members.find(m => m.id === userId);
                 if (!member) return null;
 
-                // Always use AI with retry - no fallback
+                let result: ServerBible['userProfiles'][0];
                 if (userMsgs.length >= 50) {
-                    return await this.aiAnalyzeUserWithRetry(member, userMsgs);
+                    result = await this.aiAnalyzeUserWithRetry(member, userMsgs, proModel);
                 } else {
-                    // For users with few messages, quick analysis is fine (not a fallback, just appropriate)
-                    return this.quickAnalyzeUser(member, userMsgs);
+                    result = this.quickAnalyzeUser(member, userMsgs);
+                    this.fallbackCount++;
                 }
+                this.processedCount++;
+                return result;
             });
 
             const batchResults = await Promise.all(batchPromises);
@@ -76,8 +105,9 @@ export class UserProfileBuilder {
                 if (result) profiles.push(result);
             }
 
-            await updateStatus(`  👥 Profiled ${Math.min(i + this.PARALLEL_LIMIT, topUsers.length)}/${topUsers.length} users...`);
-            
+            // Update progress after each batch
+            await updateStatus(this.formatProgress());
+
             // Delay between batches to avoid rate limits
             if (i + this.PARALLEL_LIMIT < topUsers.length) {
                 await sleep(this.DELAY_BETWEEN_BATCHES_MS);
@@ -99,40 +129,64 @@ export class UserProfileBuilder {
     }
 
     /**
-     * AI analyze with retry - NO FALLBACK
+     * Format live progress display for Discord
+     */
+    private formatProgress(): string {
+        const percent = this.totalUsers > 0
+            ? Math.round((this.processedCount / this.totalUsers) * 100)
+            : 0;
+        const barLength = 20;
+        const filled = Math.round(barLength * percent / 100);
+        const progressBar = '█'.repeat(filled) + '░'.repeat(barLength - filled);
+
+        return [
+            `👥 **LAYER 5/6: User Profiles**`,
+            ``,
+            `\`${progressBar}\` **${percent}%**`,
+            ``,
+            `📊 Progress: **${this.processedCount}** / **${this.totalUsers}** users`,
+            `✅ AI Analysis: **${this.aiSuccessCount}**`,
+            `📋 Quick Fallback: **${this.fallbackCount}**`,
+        ].join('\n');
+    }
+
+    /**
+     * AI analyze with retry and graceful fallback to quick analysis
      */
     private async aiAnalyzeUserWithRetry(
         member: { id: string; displayName: string; username: string; roles: string[] },
-        messages: RawMessage[]
+        messages: RawMessage[],
+        model: string
     ): Promise<ServerBible['userProfiles'][0]> {
         let lastError: Error | null = null;
-        
+
         for (let attempt = 0; attempt < this.MAX_RETRIES; attempt++) {
             try {
-                return await this.aiAnalyzeUser(member, messages);
+                const result = await this.aiAnalyzeUser(member, messages, model);
+                this.aiSuccessCount++;
+                return result;
             } catch (error) {
                 lastError = error instanceof Error ? error : new Error(String(error));
                 const errAny = error as any;
-                
+
                 const is429 = errAny?.status === 429 || errAny?.code === 429 ||
                     /RESOURCE_EXHAUSTED|429|rate/i.test(lastError.message);
-                
+
                 if (is429) {
                     const delay = this.BASE_RETRY_DELAY_MS * Math.pow(2, attempt);
-                    logger.info(`Rate limited on user ${member.displayName}, waiting ${delay/1000}s (attempt ${attempt + 1}/${this.MAX_RETRIES})`);
                     await sleep(delay);
                 } else if (/JSON|parse|position|escaped|Expected/i.test(lastError.message)) {
-                    logger.info(`JSON parse error for ${member.displayName}, retrying (attempt ${attempt + 1}/${this.MAX_RETRIES})`);
-                    await sleep(1000);
+                    await sleep(500);
                 } else {
-                    const delay = this.BASE_RETRY_DELAY_MS * Math.pow(2, attempt);
-                    logger.info(`Error analyzing ${member.displayName}: ${lastError.message}, retrying in ${delay/1000}s`);
-                    await sleep(delay);
+                    await sleep(1000);
                 }
             }
         }
-        
-        throw new Error(`Failed to analyze user ${member.displayName} after ${this.MAX_RETRIES} attempts: ${lastError?.message}`);
+
+        // Graceful fallback to quick analysis instead of crashing
+        logger.warn(`AI analysis failed for ${member.displayName}, using quick fallback: ${lastError?.message?.substring(0, 80)}`);
+        this.fallbackCount++;
+        return this.quickAnalyzeUser(member, messages);
     }
 
     /**
@@ -140,7 +194,8 @@ export class UserProfileBuilder {
      */
     private async aiAnalyzeUser(
         member: { id: string; displayName: string; username: string; roles: string[] },
-        messages: RawMessage[]
+        messages: RawMessage[],
+        model: string
     ): Promise<ServerBible['userProfiles'][0]> {
         // Sample diverse messages for analysis
         const sampleMessages = this.selectDiverseSample(messages, 80);
@@ -195,16 +250,24 @@ Analyze their EXACT style and output JSON:
 }`;
 
         const response = await this.client.models.generateContent({
-            model: this.proModel,
+            model: model,
             contents: prompt,
             config: {
+                systemInstruction: 'You are a linguistics expert analyzing Discord user writing styles. The content may contain informal language, slang, or profanity - this is normal for Discord. Always respond with valid JSON.',
                 maxOutputTokens: 2000,
                 temperature: 0.3,
                 responseMimeType: 'application/json',
+                safetySettings: PERMISSIVE_SAFETY_SETTINGS,
             },
         });
 
-        const rawText = response.text || '{}';
+        // Check for empty or blocked response
+        const rawText = response.text;
+        if (!rawText || rawText.trim().length === 0) {
+            const candidates = (response as any).candidates || [];
+            const blockReason = candidates[0]?.finishReason || 'unknown';
+            throw new Error(`Empty AI response for user ${member.displayName} - blockReason: ${blockReason}`);
+        }
         const result = this.safeJsonParse(rawText);
 
         return {
@@ -226,25 +289,63 @@ Analyze their EXACT style and output JSON:
             exampleMessages: sampleMessages.slice(0, 10).map(m => m.content),
         } as ServerBible['userProfiles'][0];
     }
-    
+
     /**
-     * Parse JSON with repair for common AI mistakes
+     * Robust JSON parsing with multiple repair strategies
      */
     private safeJsonParse(text: string): any {
+        // Clean the text first
+        let cleaned = text.trim();
+        cleaned = cleaned.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '');
+
+        // Try direct parse first
         try {
-            return JSON.parse(text);
-        } catch {
-            let repaired = text;
-            repaired = repaired.replace(/(["'])([^"']*?)\n([^"']*?)\1/g, '$1$2\\n$3$1');
-            repaired = repaired.replace(/,\s*([}\]])/g, '$1');
-            repaired = repaired.replace(/: "([^"]*?)"([^,}\]\n])/g, ': "$1\\"$2');
-            
+            return JSON.parse(cleaned);
+        } catch { /* continue */ }
+
+        // Try to extract JSON object from text
+        const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
+        if (jsonMatch) {
             try {
-                return JSON.parse(repaired);
-            } catch {
-                throw new Error(`JSON parse failed even after repair: ${text.substring(0, 100)}...`);
-            }
+                return JSON.parse(jsonMatch[0]);
+            } catch { /* continue */ }
         }
+
+        // Fix common issues
+        let repaired = cleaned;
+        repaired = repaired.replace(/,\s*([}\]])/g, '$1');
+
+        // Fix missing closing brackets for truncated responses
+        const openBraces = (repaired.match(/\{/g) || []).length;
+        const closeBraces = (repaired.match(/\}/g) || []).length;
+        const openBrackets = (repaired.match(/\[/g) || []).length;
+        const closeBrackets = (repaired.match(/\]/g) || []).length;
+
+        repaired = repaired.replace(/,\s*"[^"]*$/g, '');
+        repaired = repaired.replace(/:\s*"[^"]*$/g, ': ""');
+        repaired = repaired.replace(/:\s*\[[^\]]*$/g, ': []');
+        repaired = repaired.replace(/,\s*$/g, '');
+
+        repaired += ']'.repeat(Math.max(0, openBrackets - closeBrackets));
+        repaired += '}'.repeat(Math.max(0, openBraces - closeBraces));
+
+        try {
+            return JSON.parse(repaired);
+        } catch { /* continue */ }
+
+        // Extract individual fields as last resort
+        const result: any = {};
+        const personalityMatch = repaired.match(/"personality"\s*:\s*"([^"]*)"/i);
+        if (personalityMatch) result.personality = personalityMatch[1];
+
+        const mimicMatch = repaired.match(/"howToMimicThem"\s*:\s*"([^"]*)"/i);
+        if (mimicMatch) result.howToMimicThem = mimicMatch[1];
+
+        if (result.personality) {
+            return result;
+        }
+
+        throw new Error(`JSON parse failed after all strategies: ${text.substring(0, 80)}...`);
     }
 
     /**
@@ -255,7 +356,7 @@ Analyze their EXACT style and output JSON:
         messages: RawMessage[]
     ): ServerBible['userProfiles'][0] {
         const stats = this.computeTypingStats(messages);
-        
+
         const speechPatterns: string[] = [];
         if (stats.lowercaseRatio > 80) speechPatterns.push('types in all lowercase');
         if (stats.lowercaseRatio < 20) speechPatterns.push('uses proper capitalization');
@@ -285,7 +386,7 @@ Analyze their EXACT style and output JSON:
      */
     private selectDiverseSample(messages: RawMessage[], count: number): RawMessage[] {
         const sample: RawMessage[] = [];
-        
+
         // Get messages of different lengths
         const short = messages.filter(m => m.content.length < 30);
         const medium = messages.filter(m => m.content.length >= 30 && m.content.length < 100);
@@ -325,7 +426,7 @@ Analyze their EXACT style and output JSON:
         topEmojis: string[];
     } {
         const emojiPattern = /[\u{1F300}-\u{1F9FF}]|[\u{2600}-\u{26FF}]|[\u{2700}-\u{27BF}]/gu;
-        
+
         let lowercaseCount = 0;
         let punctuationCount = 0;
         let totalWords = 0;
@@ -334,16 +435,16 @@ Analyze their EXACT style and output JSON:
 
         for (const msg of messages) {
             const content = msg.content;
-            
+
             // Check if mostly lowercase
             if (content === content.toLowerCase()) lowercaseCount++;
-            
+
             // Check for ending punctuation
             if (/[.!?]$/.test(content.trim())) punctuationCount++;
-            
+
             // Word count
             totalWords += content.split(/\s+/).filter(w => w.length > 0).length;
-            
+
             // Emoji analysis
             const emojis = content.match(emojiPattern) || [];
             if (emojis.length > 0) emojiCount++;
@@ -371,7 +472,7 @@ Analyze their EXACT style and output JSON:
      */
     private extractCommonPhrases(messages: RawMessage[]): string[] {
         const phraseCount: Record<string, number> = {};
-        
+
         for (const msg of messages) {
             const words = msg.content.toLowerCase().split(/\s+/);
             // 2-word phrases
@@ -401,7 +502,7 @@ Analyze their EXACT style and output JSON:
         if (/fr|ong|no cap|facts/.test(allContent)) traits.push('real');
         if (/!{2,}|LETS|POG|YOOO/.test(messages.map(m => m.content).join(' '))) traits.push('hype');
         if (messages.filter(m => m.content.length < 20).length / messages.length > 0.7) traits.push('terse');
-        
+
         return traits.length > 0 ? traits.slice(0, 2).join(' ') : 'casual';
     }
 
@@ -435,12 +536,12 @@ Analyze their EXACT style and output JSON:
 
     private detectQuirks(messages: RawMessage[], stats: ReturnType<typeof this.computeTypingStats>): string[] {
         const quirks: string[] = [];
-        
+
         if (stats.emojiRatio > 60) quirks.push('emoji spammer');
         if (stats.emojiRatio < 5) quirks.push('no emoji andy');
         if (stats.avgWords > 25) quirks.push('writes essays');
         if (stats.avgWords < 4) quirks.push('one word responses');
-        
+
         // Check for keysmashing
         const keysmashes = messages.filter(m => /[asdf]{4,}|[hjkl]{4,}/i.test(m.content)).length;
         if (keysmashes > 3) quirks.push('keysmashes when excited');
@@ -448,7 +549,7 @@ Analyze their EXACT style and output JSON:
         // Check for double texting
         let doubleTexts = 0;
         for (let i = 1; i < messages.length; i++) {
-            if (messages[i]!.timestamp.getTime() - messages[i-1]!.timestamp.getTime() < 5000) {
+            if (messages[i]!.timestamp.getTime() - messages[i - 1]!.timestamp.getTime() < 5000) {
                 doubleTexts++;
             }
         }

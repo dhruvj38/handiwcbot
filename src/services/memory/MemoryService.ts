@@ -21,6 +21,13 @@ export class MemoryService {
     }
 
     /**
+     * Get the underlying repository (used by UserDisplayNameService)
+     */
+    getRepository(): MemoryRepository {
+        return this.repository;
+    }
+
+    /**
      * Retrieve relevant memories for a chat context
      */
     async retrieveMemoriesForChat(
@@ -33,15 +40,19 @@ export class MemoryService {
         sessionSummaries: SessionSummaryData[];
     }> {
         try {
-            // Generate embedding for the user message
-            const embedding = await this.aiService.generateEmbedding(userMessage);
+            // Check if userMessage is empty or just whitespace
+            const trimmedMessage = userMessage?.trim();
 
-            // Search server memories by similarity
-            const serverMemories = await this.repository.searchServerMemories(
-                serverId,
-                embedding,
-                config.bot.memoryRetrievalLimit
-            );
+            // Search server memories by similarity (only if we have text to embed)
+            let serverMemories: ServerMemoryData[] = [];
+            if (trimmedMessage && trimmedMessage.length > 0) {
+                const embedding = await this.aiService.generateEmbedding(serverId, trimmedMessage);
+                serverMemories = await this.repository.searchServerMemories(
+                    serverId,
+                    embedding,
+                    config.bot.memoryRetrievalLimit
+                );
+            }
 
             // Get user profiles for mentioned users
             const userProfiles: UserProfileData[] = [];
@@ -55,8 +66,19 @@ export class MemoryService {
             // Get recent session summaries
             const sessionSummaries = await this.repository.getRecentSessionSummaries(serverId, 3);
 
+            // Get recent personality habits (always include these)
+            const recentHabits = await this.repository.getServerMemoriesByType(serverId, 'habit', 5);
+
+            // Combine memories, deduplicating by ID
+            const allMemories = [...serverMemories];
+            for (const habit of recentHabits) {
+                if (!allMemories.some(m => m.id === habit.id)) {
+                    allMemories.push(habit);
+                }
+            }
+
             return {
-                serverMemories,
+                serverMemories: allMemories,
                 userProfiles,
                 sessionSummaries,
             };
@@ -69,6 +91,7 @@ export class MemoryService {
             };
         }
     }
+
 
     /**
      * Process transcript chunks and update memories
@@ -87,13 +110,13 @@ export class MemoryService {
             logger.info(`Processing ${chunks.length} transcript chunks for server ${serverId}`);
 
             // Generate summary from transcripts
-            const summary = await this.aiService.summarizeTranscripts(chunks);
+            const summary = await this.aiService.summarizeTranscripts(serverId, chunks);
 
             // Create session summary
             const timeRangeStart = chunks[0]!.startedAt;
             const timeRangeEnd = chunks[chunks.length - 1]!.endedAt;
 
-            const summaryEmbedding = await this.aiService.generateEmbedding(summary.highLevelSummary);
+            const summaryEmbedding = await this.aiService.generateEmbedding(serverId, summary.highLevelSummary);
 
             await this.repository.createSessionSummary({
                 serverId,
@@ -114,7 +137,7 @@ export class MemoryService {
             const memories = await this.aiService.generateServerMemories(serverId, summary);
 
             for (const memory of memories) {
-                const embedding = await this.aiService.generateEmbedding(memory.content);
+                const embedding = await this.aiService.generateEmbedding(serverId, memory.content);
                 await this.repository.createServerMemory({
                     serverId,
                     type: memory.type,
@@ -167,7 +190,7 @@ export class MemoryService {
             const updated = await this.aiService.updateUserProfileFromSummary(profile, summary);
 
             // Generate embedding for updated summary
-            const embedding = await this.aiService.generateEmbedding(updated.summary);
+            const embedding = await this.aiService.generateEmbedding(serverId, updated.summary);
 
             // Save updated profile
             await this.repository.upsertUserProfile({
@@ -192,10 +215,12 @@ export class MemoryService {
         serverId: string;
         channelId: string;
         userId: string | null;
+        userName?: string | null;
         startedAt: Date;
         endedAt: Date;
         rawText: string;
         metadata?: Record<string, unknown>;
+        sessionId?: string | null;
     }): Promise<TranscriptChunkData> {
         return this.repository.createTranscriptChunk(data);
     }
@@ -217,7 +242,7 @@ export class MemoryService {
      */
     async searchMemories(serverId: string, query: string): Promise<ServerMemoryData[]> {
         try {
-            const embedding = await this.aiService.generateEmbedding(query);
+            const embedding = await this.aiService.generateEmbedding(serverId, query);
             return this.repository.searchServerMemories(serverId, embedding, 10);
         } catch (error) {
             logger.error('Failed to search memories:', error);
@@ -306,7 +331,7 @@ export class MemoryService {
             logger.info(`Message count for analysis: ${data.messages.length} (targeting 100k+ for comprehensive profiling)`);
 
             // Use AI to analyze the server data
-            const analysis = await this.aiService.analyzeServerData({
+            const analysis = await this.aiService.analyzeServerData(data.serverId, {
                 serverName: data.serverName,
                 serverDescription: data.serverDescription,
                 channels: data.channels,
@@ -328,7 +353,7 @@ Channels: ${data.channels.map(c => `#${c.name}`).join(', ')}
 Roles: ${data.roles.filter(r => r.name !== '@everyone').map(r => r.name).join(', ')}
 `.trim();
 
-            const serverEmbed = await this.aiService.generateEmbedding(serverProfileContent);
+            const serverEmbed = await this.aiService.generateEmbedding(data.serverId, serverProfileContent);
             await this.repository.createServerMemory({
                 serverId: data.serverId,
                 type: 'habit',
@@ -361,8 +386,8 @@ Roles: ${data.roles.filter(r => r.name !== '@everyone').map(r => r.name).join(',
                 try {
                     const member = data.members.find(m => m.id === userProfile.userId);
                     const summaryWithDetails = `${userProfile.summary}\n\nPersonality: ${userProfile.personality}\nInterests: ${userProfile.interests.join(', ')}\nActivity Level: ${userProfile.activityLevel}`;
-                    
-                    const embedding = await this.aiService.generateEmbedding(summaryWithDetails);
+
+                    const embedding = await this.aiService.generateEmbedding(data.serverId, summaryWithDetails);
                     await this.repository.upsertUserProfile({
                         serverId: data.serverId,
                         userId: userProfile.userId,
@@ -388,7 +413,7 @@ Roles: ${data.roles.filter(r => r.name !== '@everyone').map(r => r.name).join(',
             let memoriesCreated = 0;
             for (const memory of analysis.memories) {
                 try {
-                    const embedding = await this.aiService.generateEmbedding(memory.content);
+                    const embedding = await this.aiService.generateEmbedding(data.serverId, memory.content);
                     await this.repository.createServerMemory({
                         serverId: data.serverId,
                         type: memory.type,
@@ -455,7 +480,7 @@ ${bible.vocabulary.affirmatives.slice(0, 10).join(', ')}
 `.trim();
 
             // Store as server profile memory
-            const serverEmbed = await this.aiService.generateEmbedding(serverProfileContent.substring(0, 2000));
+            const serverEmbed = await this.aiService.generateEmbedding(serverId, serverProfileContent.substring(0, 2000));
             await this.repository.createServerMemory({
                 serverId,
                 type: 'habit',
@@ -483,8 +508,8 @@ ${bible.vocabulary.affirmatives.slice(0, 10).join(', ')}
             for (const userProfile of bible.userProfiles) {
                 try {
                     const summaryWithDetails = `${userProfile.personality}\n\nSpeech patterns: ${userProfile.speechPatterns.join(', ')}\nInterests: ${userProfile.interests.join(', ')}\nQuirks: ${userProfile.quirks.join(', ')}\nHow to interact: ${userProfile.howToInteract}`;
-                    
-                    const embedding = await this.aiService.generateEmbedding(summaryWithDetails.substring(0, 1000));
+
+                    const embedding = await this.aiService.generateEmbedding(serverId, summaryWithDetails.substring(0, 1000));
                     await this.repository.upsertUserProfile({
                         serverId,
                         userId: userProfile.userId,
@@ -508,7 +533,7 @@ ${bible.vocabulary.affirmatives.slice(0, 10).join(', ')}
             // Store major lore events
             for (const lore of bible.lore.majorEvents.slice(0, 20)) {
                 try {
-                    const embedding = await this.aiService.generateEmbedding(lore.description);
+                    const embedding = await this.aiService.generateEmbedding(serverId, lore.description);
                     await this.repository.createServerMemory({
                         serverId,
                         type: 'event',
@@ -528,7 +553,7 @@ ${bible.vocabulary.affirmatives.slice(0, 10).join(', ')}
             // Store memes
             for (const meme of bible.lore.memes.slice(0, 20)) {
                 try {
-                    const embedding = await this.aiService.generateEmbedding(meme.description);
+                    const embedding = await this.aiService.generateEmbedding(serverId, meme.description);
                     await this.repository.createServerMemory({
                         serverId,
                         type: 'meme',
@@ -548,6 +573,67 @@ ${bible.vocabulary.affirmatives.slice(0, 10).join(', ')}
         } catch (error) {
             logger.error('Failed to store Server Bible:', error);
             throw error;
+        }
+    }
+
+    /**
+     * Store a GIF memory from gif_train command
+     */
+    async storeGifMemory(serverId: string, data: {
+        title: string;
+        gifUrl: string;
+        description: string;
+        usageCount: number;
+        channelId: string;
+    }): Promise<void> {
+        try {
+            const content = `${data.description}\n\nGIF URL: ${data.gifUrl}`;
+            const embedding = await this.aiService.generateEmbedding(serverId, content);
+
+            await this.repository.createServerMemory({
+                serverId,
+                type: 'meme', // GIFs are stored as 'meme' type
+                title: data.title,
+                content,
+                embedding,
+                metadata: {
+                    isGif: true,
+                    gifUrl: data.gifUrl,
+                    usageCount: data.usageCount,
+                    channelId: data.channelId,
+                    trainedAt: new Date().toISOString(),
+                },
+            });
+
+            logger.info(`Stored GIF memory: ${data.title} (${data.usageCount} uses)`);
+        } catch (error) {
+            logger.error('Failed to store GIF memory:', error);
+            throw error;
+        }
+    }
+
+    /**
+     * Search GIF memories by text similarity
+     */
+    async searchGifMemoriesByText(serverId: string, query: string, limit: number = 5): Promise<ServerMemoryData[]> {
+        try {
+            if (!query || query.trim().length === 0) {
+                return [];
+            }
+
+            const embedding = await this.aiService.generateEmbedding(serverId, query);
+            const memories = await this.repository.searchServerMemories(serverId, embedding, limit * 3);
+
+            // Filter to only GIF memories
+            const gifMemories = memories.filter(m => {
+                const meta = m.metadata as Record<string, unknown> | null;
+                return meta?.isGif === true && meta?.gifUrl;
+            });
+
+            return gifMemories.slice(0, limit);
+        } catch (error) {
+            logger.error('Failed to search GIF memories:', error);
+            return [];
         }
     }
 
@@ -580,5 +666,43 @@ ${bible.vocabulary.affirmatives.slice(0, 10).join(', ')}
             logger.error('Failed to clear memories:', error);
             throw error;
         }
+    }
+    /**
+     * Store a style rule
+     */
+    async storeStyleRule(serverId: string, rule: string): Promise<void> {
+        try {
+            const embedding = await this.aiService.generateEmbedding(serverId, rule);
+            await this.repository.createServerMemory({
+                serverId,
+                type: 'rule',
+                title: 'Style Rule',
+                content: rule,
+                embedding,
+                metadata: {
+                    isStyleRule: true,
+                    createdAt: new Date().toISOString(),
+                },
+            });
+            logger.info(`Stored style rule for server ${serverId}`);
+        } catch (error) {
+            logger.error('Failed to store style rule:', error);
+            throw error;
+        }
+    }
+
+    /**
+     * Update user nickname
+     */
+    async updateUserNickname(serverId: string, userId: string, nickname: string, source: string = 'manual'): Promise<void> {
+        return this.repository.updateUserNickname(serverId, userId, nickname, source);
+    }
+
+    /**
+     * Get user nickname
+     */
+    async getUserNickname(serverId: string, userId: string): Promise<string | null> {
+        const profile = await this.repository.getUserProfile(serverId, userId);
+        return profile?.displayName || null;
     }
 }

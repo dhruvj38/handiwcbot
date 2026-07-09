@@ -11,6 +11,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { logger } from '../../utils/logger';
+import { ServerBible } from './types';
 
 export interface CachedMessage {
     channelId: string;
@@ -40,10 +41,11 @@ export class MessageCache {
     /**
      * Get the cache file paths for a server
      */
-    private static getCachePaths(serverId: string): { csv: string; meta: string } {
+    private static getCachePaths(serverId: string): { csv: string; meta: string; bible: string } {
         return {
             csv: path.join(CACHE_DIR, `${serverId}_messages.csv`),
             meta: path.join(CACHE_DIR, `${serverId}_meta.json`),
+            bible: path.join(CACHE_DIR, `${serverId}_bible.json`),
         };
     }
 
@@ -62,7 +64,7 @@ export class MessageCache {
      */
     static hasValidCache(serverId: string): boolean {
         const paths = this.getCachePaths(serverId);
-        
+
         if (!fs.existsSync(paths.csv) || !fs.existsSync(paths.meta)) {
             return false;
         }
@@ -73,7 +75,7 @@ export class MessageCache {
 
             const ageMs = Date.now() - new Date(meta.cachedAt).getTime();
             const ageDays = ageMs / (1000 * 60 * 60 * 24);
-            
+
             if (ageDays > CACHE_MAX_AGE_DAYS) {
                 logger.info(`Cache for ${serverId} is ${ageDays.toFixed(1)} days old (max: ${CACHE_MAX_AGE_DAYS})`);
                 return false;
@@ -93,7 +95,7 @@ export class MessageCache {
     static getCacheAge(serverId: string): number | null {
         const meta = this.loadMetadata(serverId);
         if (!meta) return null;
-        
+
         const ageMs = Date.now() - new Date(meta.cachedAt).getTime();
         return ageMs / (1000 * 60 * 60 * 24);
     }
@@ -103,7 +105,7 @@ export class MessageCache {
      */
     static loadMetadata(serverId: string): CacheMetadata | null {
         const paths = this.getCachePaths(serverId);
-        
+
         if (!fs.existsSync(paths.meta)) {
             return null;
         }
@@ -122,7 +124,7 @@ export class MessageCache {
      */
     static loadMessages(serverId: string): CachedMessage[] {
         const paths = this.getCachePaths(serverId);
-        
+
         if (!fs.existsSync(paths.csv)) {
             return [];
         }
@@ -134,7 +136,7 @@ export class MessageCache {
 
             for (const line of lines) {
                 if (!line.trim()) continue;
-                
+
                 // Parse CSV (handle quoted fields with commas)
                 const parsed = this.parseCSVLine(line);
                 if (parsed.length >= 9) {
@@ -179,7 +181,7 @@ export class MessageCache {
                 const escapedContent = `"${(m.content || '').replace(/"/g, '""').replace(/\n/g, '\\n')}"`;
                 const escapedAuthor = `"${(m.authorName || '').replace(/"/g, '""')}"`;
                 const escapedChannel = `"${(m.channelName || '').replace(/"/g, '""')}"`;
-                
+
                 return [
                     m.channelId,
                     escapedChannel,
@@ -237,19 +239,19 @@ export class MessageCache {
         const queryLower = query.toLowerCase();
         const maxResults = options.maxResults || 100;
 
-        let filtered = messages.filter(m => {
+        const filtered = messages.filter(m => {
             // Text search
             if (!m.content.toLowerCase().includes(queryLower)) return false;
-            
+
             // Author filter
             if (options.authorId && m.authorId !== options.authorId) return false;
-            
+
             // Channel filter
             if (options.channelId && m.channelId !== options.channelId) return false;
-            
+
             // Date filter
             if (options.afterDate && m.timestamp < options.afterDate) return false;
-            
+
             return true;
         });
 
@@ -299,6 +301,49 @@ export class MessageCache {
         };
     }
 
+    static saveBibleSnapshot(serverId: string, bible: ServerBible): void {
+        this.ensureCacheDir();
+        const paths = this.getCachePaths(serverId);
+
+        try {
+            const serialized = JSON.stringify(bible, null, 2);
+            fs.writeFileSync(paths.bible, serialized, 'utf-8');
+            logger.info(`Saved Server Bible snapshot for ${serverId}`);
+        } catch (error) {
+            logger.error(`Failed to save Server Bible snapshot for ${serverId}:`, error);
+        }
+    }
+
+    static loadBibleSnapshot(serverId: string): ServerBible | null {
+        const paths = this.getCachePaths(serverId);
+
+        if (!fs.existsSync(paths.bible)) {
+            return null;
+        }
+
+        try {
+            const content = fs.readFileSync(paths.bible, 'utf-8');
+            const parsed = JSON.parse(content) as ServerBible;
+
+            if (parsed.metadata?.generatedAt) {
+                parsed.metadata.generatedAt = new Date(parsed.metadata.generatedAt as any);
+            }
+
+            if (parsed.metadata?.dateRange) {
+                const range = parsed.metadata.dateRange as any;
+                parsed.metadata.dateRange = {
+                    start: new Date(range.start),
+                    end: new Date(range.end),
+                };
+            }
+
+            return parsed;
+        } catch (error) {
+            logger.error(`Failed to load Server Bible snapshot for ${serverId}:`, error);
+            return null;
+        }
+    }
+
     /**
      * Parse a CSV line handling quoted fields
      */
@@ -338,10 +383,11 @@ export class MessageCache {
      */
     static deleteCache(serverId: string): void {
         const paths = this.getCachePaths(serverId);
-        
+
         try {
             if (fs.existsSync(paths.csv)) fs.unlinkSync(paths.csv);
             if (fs.existsSync(paths.meta)) fs.unlinkSync(paths.meta);
+            if (fs.existsSync(paths.bible)) fs.unlinkSync(paths.bible);
             logger.info(`Deleted cache for ${serverId}`);
         } catch (error) {
             logger.warn(`Failed to delete cache for ${serverId}:`, error);

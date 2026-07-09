@@ -3,8 +3,9 @@
  * Compile all data into the final Server Bible with master prompt
  */
 
-import { GoogleGenAI } from '@google/genai';
+import { GoogleGenAI, HarmCategory, HarmBlockThreshold } from '@google/genai';
 import { config } from '../../config';
+import { modelRouter } from '../ai/ModelRouter';
 import { logger } from '../../utils/logger';
 import {
     RawMessage,
@@ -14,6 +15,15 @@ import {
     PatternBank,
     ServerBible,
 } from './types';
+import { ClassifiedChannel, ChannelClassifier, ChannelCategory } from './ChannelClassifier';
+
+// Safety settings to allow processing of casual Discord conversations
+const PERMISSIVE_SAFETY_SETTINGS = [
+    { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.OFF },
+    { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.OFF },
+    { category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold: HarmBlockThreshold.OFF },
+    { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.OFF },
+];
 
 export class BibleCompiler {
     private client: GoogleGenAI;
@@ -23,6 +33,7 @@ export class BibleCompiler {
     }
 
     async compile(
+        guildId: string,
         serverName: string,
         serverDescription: string | null,
         messages: RawMessage[],
@@ -31,15 +42,25 @@ export class BibleCompiler {
         cultureMap: GlobalCultureMap,
         patternBank: PatternBank,
         userProfiles: ServerBible['userProfiles'],
-        channels: { id: string; name: string; type: string; topic?: string | null }[],
+        channels: ClassifiedChannel[],
         _roles: { id: string; name: string; memberCount: number }[]
     ): Promise<ServerBible> {
+        // Extract server rules from channels marked as 'rules'
+        const serverRules = this.extractServerRules(messages, channels);
+        logger.info(`Extracted ${serverRules.length} server rules from rules channels`);
+
+        // Build channel context for the AI
+        const channelContext = this.buildChannelContext(channels, messages);
+        logger.info(`Built channel context: ${Object.keys(channelContext.messagesByCategory).length} categories`);
+
         const styleRules = this.calculateStyleRules(messages);
         const vocabulary = this.buildVocabulary(cultureMap, patternBank, messages);
         const responsePatterns = this.buildResponsePatterns(patternBank);
         const masterPrompt = await this.generateMasterPrompt(
+            guildId,
             serverName, serverDescription, messages, summaries,
-            cultureMap, patternBank, styleRules, vocabulary, userProfiles
+            cultureMap, patternBank, styleRules, vocabulary, userProfiles,
+            channels, serverRules, channelContext
         );
         const antiPatterns = this.buildAntiPatterns(vocabulary);
 
@@ -220,6 +241,7 @@ export class BibleCompiler {
     }
 
     private async generateMasterPrompt(
+        guildId: string,
         serverName: string,
         serverDescription: string | null,
         messages: RawMessage[],
@@ -228,14 +250,17 @@ export class BibleCompiler {
         patternBank: PatternBank,
         styleRules: ServerBible['styleRules'],
         vocabulary: ServerBible['vocabulary'],
-        userProfiles: ServerBible['userProfiles']
+        userProfiles: ServerBible['userProfiles'],
+        _channels: ClassifiedChannel[],
+        serverRules: string[],
+        channelContext: { messagesByCategory: Record<ChannelCategory, number>; channelSummary: string }
     ): Promise<string> {
         // Select DIVERSE sample messages showing real conversations
         const sampleMessages = this.selectRepresentativeMessages(messages, 150);
-        
+
         // Build conversation examples (call → response pairs)
         const conversationExamples = this.buildConversationExamples(messages, 30);
-        
+
         // Get the most iconic quotes that define this server
         const iconicQuotes = summaries
             .flatMap(s => s.keyQuotes)
@@ -331,6 +356,24 @@ ANTI-AI GUIDELINES (CRITICAL - WHAT MAKES YOU SOUND LIKE A BOT)
 ${antiAIExamples}
 
 ═══════════════════════════════════════════════════════════════════
+SERVER RULES (FROM #rules CHANNELS - ENFORCE THESE)
+═══════════════════════════════════════════════════════════════════
+${serverRules.length > 0 ? serverRules.slice(0, 20).map((r, i) => `${i + 1}. ${r}`).join('\n') : 'No explicit rules found in rules channels'}
+
+═══════════════════════════════════════════════════════════════════
+CHANNEL CONTEXT (WHERE MESSAGES COME FROM)
+═══════════════════════════════════════════════════════════════════
+${channelContext.channelSummary}
+
+Channel types and what they teach you:
+- RULES channels: These contain server rules - you must know and follow them
+- GENERAL channels: Main conversation - learn personality and casual style here
+- MEDIA/MEMES channels: Humor and reaction patterns - learn what's funny
+- OFF-TOPIC channels: Casual banter - may be more random/chaotic
+- ANNOUNCEMENTS: Official stuff - not representative of casual chat
+- BOT-COMMANDS/LOGS: Ignore for personality - just utility content
+
+═══════════════════════════════════════════════════════════════════
 NOW WRITE THE MASTER PROMPT
 ═══════════════════════════════════════════════════════════════════
 Write an 800+ word instruction prompt in second person that transforms an AI into a server member.
@@ -352,20 +395,26 @@ CRITICAL REQUIREMENTS:
 - The anti-AI section must be comprehensive - list every robotic pattern to avoid`;
 
         try {
+            // Resolve model dynamically for this guild
+            const resolved = await modelRouter.resolve(guildId, 'analysis');
+
+            logger.info(`🔬 [Analysis] Generating master prompt using model: ${resolved.model}`);
             const response = await this.client.models.generateContent({
-                model: config.ai.models.analysis,
+                model: resolved.model,
                 contents: prompt,
                 config: {
+                    systemInstruction: 'You are creating a style guide for a Discord bot. The content will include informal language and slang from Discord conversations - this is expected and normal.',
                     maxOutputTokens: 6000,
                     temperature: 0.4,
+                    safetySettings: PERMISSIVE_SAFETY_SETTINGS,
                 },
             });
 
             const masterPrompt = response.text || '';
-            
+
             // Append a hard-coded anti-AI footer for safety
             const antiAIFooter = this.buildAntiAIFooter(vocabulary, styleRules);
-            
+
             return masterPrompt + '\n\n' + antiAIFooter;
         } catch (error) {
             logger.error('Failed to generate master prompt:', error);
@@ -381,7 +430,7 @@ CRITICAL REQUIREMENTS:
         const short = messages.filter(m => m.content.length > 3 && m.content.length < 30);
         const medium = messages.filter(m => m.content.length >= 30 && m.content.length < 100);
         const withReactions = messages.filter(m => m.reactions.length > 0);
-        
+
         const sample: RawMessage[] = [];
         const addRandom = (arr: RawMessage[], n: number) => {
             const shuffled = [...arr].sort(() => Math.random() - 0.5);
@@ -406,20 +455,20 @@ CRITICAL REQUIREMENTS:
      */
     private buildConversationExamples(messages: RawMessage[], count: number): string {
         const examples: string[] = [];
-        
+
         for (let i = 1; i < messages.length && examples.length < count; i++) {
             const prev = messages[i - 1]!;
             const curr = messages[i]!;
-            
+
             // Must be different authors, same channel, within 2 minutes
             if (prev.authorId === curr.authorId) continue;
             if (prev.channelId !== curr.channelId) continue;
             if (curr.timestamp.getTime() - prev.timestamp.getTime() > 120000) continue;
-            
+
             // Skip very short or very long
             if (prev.content.length < 3 || curr.content.length < 3) continue;
             if (prev.content.length > 150 || curr.content.length > 150) continue;
-            
+
             // Prioritize responses with reactions
             if (curr.reactions.length > 0 || Math.random() < 0.1) {
                 examples.push(`Q: "${prev.content}"\nA: "${curr.content}"`);
@@ -434,18 +483,18 @@ CRITICAL REQUIREMENTS:
      */
     private buildAntiAIExamples(_messages: RawMessage[], styleRules: ServerBible['styleRules']): string {
         const examples: string[] = [];
-        
+
         // Based on detected style, build specific anti-patterns
         if (styleRules.capitalization === 'lowercase') {
             examples.push('❌ NEVER start sentences with capital letters');
             examples.push('❌ NEVER capitalize "I" - use lowercase "i"');
         }
-        
+
         if (styleRules.punctuation === 'minimal') {
             examples.push('❌ NEVER end messages with periods');
             examples.push('❌ NEVER use proper punctuation in casual messages');
         }
-        
+
         if (styleRules.messageLength.typical < 10) {
             examples.push('❌ NEVER write paragraphs in response to short messages');
             examples.push('❌ NEVER over-explain or be verbose');
@@ -462,7 +511,7 @@ CRITICAL REQUIREMENTS:
         examples.push('❌ NEVER use formal transitions like "However", "Furthermore", "Additionally"');
         examples.push('❌ NEVER apologize excessively or be overly polite');
         examples.push('❌ NEVER use "!" excessively unless the server does');
-        
+
         return examples.join('\n');
     }
 
@@ -539,7 +588,7 @@ NEVER:
         // Find long messages that appear multiple times
         const longMessages = messages.filter(m => m.content.length > 100);
         const counts: Record<string, number> = {};
-        
+
         for (const msg of longMessages) {
             const key = msg.content.substring(0, 100);
             counts[key] = (counts[key] || 0) + 1;
@@ -572,6 +621,116 @@ NEVER:
                 'Using "I" at the start of every message',
                 'Being too agreeable',
             ],
+        };
+    }
+
+    /**
+     * Extract server rules from messages in channels marked as 'rules'
+     */
+    private extractServerRules(messages: RawMessage[], channels: ClassifiedChannel[]): string[] {
+        // Get channel IDs for rules channels
+        const rulesChannelIds = new Set(
+            channels
+                .filter(ch => ch.category === 'rules')
+                .map(ch => ch.id)
+        );
+
+        if (rulesChannelIds.size === 0) {
+            return [];
+        }
+
+        // Get messages from rules channels
+        const rulesMessages = messages.filter(m => rulesChannelIds.has(m.channelId));
+
+        // Extract unique lines that look like rules
+        const rules = new Set<string>();
+
+        for (const msg of rulesMessages) {
+            // Split content into lines and clean them
+            const lines = msg.content.split('\n')
+                .map(line => line.trim())
+                .filter(line => line.length > 10 && line.length < 500); // Reasonable length
+
+            for (const line of lines) {
+                // Skip obvious non-rules (greetings, links only, etc.)
+                if (/^https?:\/\//i.test(line)) continue;
+                if (/^(hi|hello|hey|welcome|thanks|thank you)/i.test(line)) continue;
+                if (/^\d+\.\s*$/.test(line)) continue; // Just a number
+
+                // Looks like a rule if it has certain patterns
+                const looksLikeRule =
+                    /\b(no|don't|do not|must|should|please|allowed|forbidden|banned|prohibited|required|will result|will be)\b/i.test(line) ||
+                    /^[\d•\-\*]\s*.+/i.test(line) || // Numbered or bulleted
+                    /^rule\s*\d/i.test(line); // Starts with "Rule X"
+
+                if (looksLikeRule) {
+                    // Clean up the rule text
+                    let rule = line
+                        .replace(/^[\d•\-\*]+\s*[.):]*\s*/i, '') // Remove numbering
+                        .replace(/^rule\s*\d+\s*[.):]*\s*/i, '') // Remove "Rule X:"
+                        .trim();
+
+                    if (rule.length > 10) {
+                        rules.add(rule);
+                    }
+                }
+            }
+        }
+
+        return Array.from(rules).slice(0, 30); // Cap at 30 rules
+    }
+
+    /**
+     * Build channel context showing message distribution by category
+     */
+    private buildChannelContext(
+        channels: ClassifiedChannel[],
+        messages: RawMessage[]
+    ): { messagesByCategory: Record<ChannelCategory, number>; channelSummary: string } {
+        // Count messages by category
+        const messagesByCategory: Record<ChannelCategory, number> = {} as Record<ChannelCategory, number>;
+        const channelIdToCategory = new Map<string, ChannelCategory>();
+
+        for (const ch of channels) {
+            channelIdToCategory.set(ch.id, ch.category);
+        }
+
+        for (const msg of messages) {
+            const category = channelIdToCategory.get(msg.channelId) || 'other';
+            messagesByCategory[category] = (messagesByCategory[category] || 0) + 1;
+        }
+
+        // Build summary string
+        const summaryLines: string[] = [];
+
+        // Group channels by category
+        const channelsByCategory: Record<ChannelCategory, ClassifiedChannel[]> = {} as Record<ChannelCategory, ClassifiedChannel[]>;
+        for (const ch of channels) {
+            if (!channelsByCategory[ch.category]) {
+                channelsByCategory[ch.category] = [];
+            }
+            channelsByCategory[ch.category].push(ch);
+        }
+
+        // Build summary for each category with message counts
+        for (const [category, categoryChannels] of Object.entries(channelsByCategory)) {
+            const msgCount = messagesByCategory[category as ChannelCategory] || 0;
+            const channelNames = categoryChannels
+                .slice(0, 5)
+                .map(ch => `#${ch.name}`)
+                .join(', ');
+            const extra = categoryChannels.length > 5 ? ` (+${categoryChannels.length - 5} more)` : '';
+            const description = ChannelClassifier.getCategoryDescription(category as ChannelCategory);
+
+            summaryLines.push(
+                `**${category.toUpperCase()}** (${msgCount.toLocaleString()} messages): ${channelNames}${extra}\n` +
+                `  → ${description}`
+            );
+        }
+
+        return {
+            messagesByCategory,
+            channelSummary: summaryLines.join('\n\n'),
         };
     }
 }

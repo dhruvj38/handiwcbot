@@ -9,7 +9,15 @@ export async function registerCommands(): Promise<void> {
     try {
         logger.info('Started refreshing application (/) commands.');
 
+        // Always clear global commands to prevent duplicates
+        logger.info('Clearing any stale global commands...');
+        await rest.put(
+            Routes.applicationCommands(config.discord.clientId),
+            { body: [] }
+        );
+
         if (config.discord.guildId) {
+
             // Register commands for a specific guild (faster for development)
             await rest.put(
                 Routes.applicationGuildCommands(config.discord.clientId, config.discord.guildId),

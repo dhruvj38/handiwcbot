@@ -1,0 +1,184 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 0 0% 3.9%;
+    --foreground: 0 0% 98%;
+    --card: 0 0% 7%;
+    --card-foreground: 0 0% 98%;
+    --popover: 0 0% 7%;
+    --popover-foreground: 0 0% 98%;
+    --primary: 262 83% 58%;
+    --primary-foreground: 0 0% 98%;
+    --secondary: 0 0% 14.9%;
+    --secondary-foreground: 0 0% 98%;
+    --muted: 0 0% 14.9%;
+    --muted-foreground: 0 0% 63.9%;
+    --accent: 0 0% 14.9%;
+    --accent-foreground: 0 0% 98%;
+    --destructive: 0 62.8% 30.6%;
+    --destructive-foreground: 0 0% 98%;
+    --border: 0 0% 14.9%;
+    --input: 0 0% 14.9%;
+    --ring: 262 83% 58%;
+    --radius: 0.5rem;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground antialiased;
+  }
+  
+  /* Smooth scrolling */
+  html {
+    scroll-behavior: smooth;
+  }
+  
+  /* Custom scrollbar */
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  
+  ::-webkit-scrollbar-track {
+    background: hsl(var(--background));
+  }
+  
+  ::-webkit-scrollbar-thumb {
+    background: hsl(var(--muted));
+    border-radius: 4px;
+  }
+  
+  ::-webkit-scrollbar-thumb:hover {
+    background: hsl(var(--muted-foreground));
+  }
+}
+
+@layer components {
+  /* Card hover effects */
+  .card-hover {
+    @apply transition-all duration-200 hover:border-zinc-700 hover:shadow-lg hover:shadow-black/20;
+  }
+  
+  /* Status badges */
+  .status-badge {
+    @apply inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium;
+  }
+  
+  .status-badge-success {
+    @apply bg-green-500/10 text-green-500 border border-green-500/20;
+  }
+  
+  .status-badge-warning {
+    @apply bg-yellow-500/10 text-yellow-500 border border-yellow-500/20;
+  }
+  
+  .status-badge-error {
+    @apply bg-red-500/10 text-red-500 border border-red-500/20;
+  }
+  
+  .status-badge-info {
+    @apply bg-blue-500/10 text-blue-500 border border-blue-500/20;
+  }
+  
+  /* Form inputs */
+  .input {
+    @apply w-full rounded-lg border border-zinc-700 bg-zinc-800 px-3 py-2 text-sm 
+           transition-colors duration-200
+           focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary
+           placeholder:text-zinc-500;
+  }
+  
+  .input-error {
+    @apply border-red-500 focus:border-red-500 focus:ring-red-500;
+  }
+  
+  /* Buttons */
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 rounded-lg px-4 py-2 text-sm font-medium
+           transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+  
+  .btn-primary {
+    @apply bg-primary text-primary-foreground hover:bg-primary/90 active:scale-[0.98];
+  }
+  
+  .btn-secondary {
+    @apply bg-zinc-800 text-zinc-100 hover:bg-zinc-700 border border-zinc-700;
+  }
+  
+  .btn-ghost {
+    @apply text-muted-foreground hover:text-foreground hover:bg-zinc-800;
+  }
+  
+  .btn-danger {
+    @apply bg-red-500/10 text-red-500 hover:bg-red-500/20 border border-red-500/20;
+  }
+  
+  /* Toggle switch animation */
+  .toggle-switch {
+    @apply relative h-6 w-11 rounded-full transition-colors duration-200;
+  }
+  
+  .toggle-switch-thumb {
+    @apply absolute top-0.5 h-5 w-5 rounded-full bg-white transition-transform duration-200;
+  }
+}
+
+@layer utilities {
+  /* Animation utilities */
+  .animate-fade-in {
+    animation: fadeIn 0.3s ease-out;
+  }
+  
+  .animate-slide-up {
+    animation: slideUp 0.3s ease-out;
+  }
+  
+  .animate-slide-down {
+    animation: slideDown 0.3s ease-out;
+  }
+  
+  @keyframes fadeIn {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
+  
+  @keyframes slideUp {
+    from { 
+      opacity: 0; 
+      transform: translateY(10px); 
+    }
+    to { 
+      opacity: 1; 
+      transform: translateY(0); 
+    }
+  }
+  
+  @keyframes slideDown {
+    from { 
+      opacity: 0; 
+      transform: translateY(-10px); 
+    }
+    to { 
+      opacity: 1; 
+      transform: translateY(0); 
+    }
+  }
+  
+  /* Gradient text */
+  .text-gradient {
+    @apply bg-gradient-to-r from-primary to-purple-400 bg-clip-text text-transparent;
+  }
+  
+  /* Glass effect */
+  .glass {
+    @apply bg-zinc-900/50 backdrop-blur-sm;
+  }
+}

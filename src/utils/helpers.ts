@@ -9,8 +9,8 @@ export interface RetryOptions {
 
 const defaultRetryOptions: RetryOptions = {
     maxRetries: 3,
-    baseDelayMs: 1000,
-    maxDelayMs: 10000,
+    baseDelayMs: 500,  // Reduced from 1000ms for faster recovery
+    maxDelayMs: 5000,  // Reduced from 10000ms
 };
 
 /**
@@ -36,16 +36,26 @@ function isRetryableError(error: unknown, retryableErrors?: string[]): boolean {
     if (!retryableErrors) {
         // Default retryable conditions
         if (error instanceof Error) {
+            const anyErr = error as any;
             const message = error.message.toLowerCase();
+            const causeMessage =
+                typeof anyErr?.cause?.message === 'string'
+                    ? (anyErr.cause.message as string).toLowerCase()
+                    : '';
+            const combined = `${message} ${causeMessage}`;
+
             return (
-                message.includes('timeout') ||
-                message.includes('network') ||
-                message.includes('econnreset') ||
-                message.includes('enotfound') ||
-                message.includes('rate limit') ||
-                message.includes('503') ||
-                message.includes('502') ||
-                message.includes('429')
+                error.name === 'AbortError' ||
+                combined.includes('aborted') ||
+                combined.includes('timeout') ||
+                combined.includes('network') ||
+                combined.includes('econnreset') ||
+                combined.includes('enotfound') ||
+                combined.includes('rate limit') ||
+                combined.includes('503') ||
+                combined.includes('502') ||
+                combined.includes('429') ||
+                anyErr?.cause?.code === 'UND_ERR_HEADERS_TIMEOUT'
             );
         }
         return false;
@@ -87,9 +97,11 @@ export async function retryWithBackoff<T>(
             }
 
             const delay = calculateBackoff(attempt, opts.baseDelayMs, opts.maxDelayMs);
+            // Extract concise error info
+            const errorMsg = formatErrorShort(error);
             logger.warn(
-                `${context} failed (attempt ${attempt + 1}/${opts.maxRetries + 1}). Retrying in ${delay}ms...`,
-                error
+                `${context} failed (attempt ${attempt + 1}/${opts.maxRetries + 1}). Retrying in ${delay.toFixed(0)}ms...`,
+                { error: errorMsg }
             );
 
             await sleep(delay);
@@ -119,6 +131,31 @@ export function chunkArray<T>(array: T[], chunkSize: number): T[][] {
         chunks.push(array.slice(i, i + chunkSize));
     }
     return chunks;
+}
+
+/**
+ * Format error for concise logging (avoid dumping full API responses)
+ */
+export function formatErrorShort(error: unknown): { message: string; status?: number; name?: string } {
+    if (error instanceof Error) {
+        const anyErr = error as any;
+        const status = anyErr.status || anyErr.code || anyErr.statusCode;
+        // Extract just the main message, not the full JSON dump
+        let msg = error.message;
+        // If message contains JSON, extract the core message
+        if (msg.includes('"message":')) {
+            const match = msg.match(/"message":\s*"([^"]+)"/);
+            if (match && match[1]) {
+                msg = match[1].split('\\n')[0] ?? match[1]; // First line only
+            }
+        }
+        // Truncate long messages
+        if (msg.length > 100) {
+            msg = msg.substring(0, 100) + '...';
+        }
+        return { message: msg, status, name: error.name };
+    }
+    return { message: String(error).substring(0, 100) };
 }
 
 /**

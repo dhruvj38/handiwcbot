@@ -255,10 +255,12 @@ export class MemoryRepository {
         serverId: string;
         channelId: string;
         userId: string | null;
+        userName?: string | null;
         startedAt: Date;
         endedAt: Date;
         rawText: string;
         metadata?: Record<string, unknown>;
+        sessionId?: string | null;
     }): Promise<TranscriptChunkData> {
         try {
             const result = await this.db.transcriptChunk.create({
@@ -266,10 +268,12 @@ export class MemoryRepository {
                     serverId: data.serverId,
                     channelId: data.channelId,
                     userId: data.userId,
+                    userName: data.userName,
                     startedAt: data.startedAt,
                     endedAt: data.endedAt,
                     rawText: data.rawText,
                     metadata: data.metadata as any,
+                    sessionId: data.sessionId,
                 },
             });
 
@@ -607,6 +611,38 @@ export class MemoryRepository {
             `;
         } catch (error) {
             logger.error('Failed to delete user profile:', error);
+            throw error;
+        }
+    }
+    /**
+     * Update user nickname
+     */
+    async updateUserNickname(serverId: string, userId: string, nickname: string, source: string = 'manual'): Promise<void> {
+        try {
+            // Check if profile exists
+            const profile = await this.getUserProfile(serverId, userId);
+
+            if (profile) {
+                await this.db.$executeRaw`
+                    UPDATE user_profiles 
+                    SET "displayName" = ${nickname}, "lastUpdated" = NOW()
+                    WHERE "serverId" = ${serverId} AND "userId" = ${userId}
+                `;
+            } else {
+                // Create new profile with just the nickname
+                await this.upsertUserProfile({
+                    serverId,
+                    userId,
+                    displayName: nickname,
+                    summary: `User known as ${nickname}`,
+                    tags: [],
+                    metadata: {
+                        nicknameSource: source
+                    }
+                });
+            }
+        } catch (error) {
+            logger.error('Failed to update user nickname:', error);
             throw error;
         }
     }

@@ -22,8 +22,11 @@ import { MemoryService } from '../../services/memory/MemoryService';
 import { AiService } from '../../services/ai/AiService';
 import { RealtimeLearningService } from '../../services/learning/RealtimeLearningService';
 import { config } from '../../config';
+import { runtimeConfig } from '../../services/RuntimeConfigManager';
 import { VoiceSession } from '../../types';
 import { createWavBuffer, hasAudioContent, getAudioDuration } from '../../utils/audioUtils';
+import { createPcmStreamFromOpus } from './OpusPcmDecoder';
+import { getPrismaClient } from '../../db/client';
 
 export class VoiceSessionManager {
     private sessions: Map<string, VoiceSession>;
@@ -35,6 +38,7 @@ export class VoiceSessionManager {
     private audioPlayers: Map<string, AudioPlayer>;
     private lastChimeTime: Map<string, number>;
     private recentTranscripts: Map<string, Array<{ userId: string; text: string; timestamp: Date }>>;
+    private dbSessionIds: Map<string, string>; // sessionId -> database VoiceSessionTranscript.id
 
     private speechService: SpeechService;
     private ttsService: TtsService;
@@ -59,6 +63,7 @@ export class VoiceSessionManager {
         this.audioPlayers = new Map();
         this.lastChimeTime = new Map();
         this.recentTranscripts = new Map();
+        this.dbSessionIds = new Map();
         this.speechService = speechService;
         this.ttsService = ttsService;
         this.memoryService = memoryService;
@@ -71,6 +76,9 @@ export class VoiceSessionManager {
         } catch (error) {
             // Directory already exists
         }
+
+        // Listen for config changes to update active sessions
+        this.setupConfigListeners();
     }
 
     /**
@@ -81,11 +89,100 @@ export class VoiceSessionManager {
     }
 
     /**
+     * Listen for configuration changes
+     */
+    private setupConfigListeners(): void {
+        runtimeConfig.onConfigChange(async (change) => {
+            const guildId = change.guildId;
+            
+            // Handle voice master switch being toggled off
+            if (change.field === 'voiceEnabled' && change.newValue === false) {
+                logger.info(`[VoiceSession] Voice disabled for guild ${guildId}, ending all sessions`);
+                
+                // End all active sessions for this guild
+                for (const [sessionId, session] of this.sessions.entries()) {
+                    if (session.serverId === guildId) {
+                        await this.stopSession(session.serverId, session.channelId);
+                    }
+                }
+                return;
+            }
+            
+            // Handle TTS toggle
+            if (change.field === 'ttsEnabled') {
+                const isEnabled = change.newValue as boolean;
+
+                logger.info(`[VoiceSession] TTS setting changed for guild ${guildId}: ${isEnabled}`);
+
+                // Update all active sessions for this guild
+                for (const [sessionId, session] of this.sessions.entries()) {
+                    if (session.serverId === guildId) {
+                        await this.updateSessionTtsState(sessionId, isEnabled);
+                    }
+                }
+            }
+        });
+    }
+
+    /**
+     * Update TTS state for an active session
+     */
+    private async updateSessionTtsState(sessionId: string, enabled: boolean): Promise<void> {
+        const connection = this.connections.get(sessionId);
+        if (!connection) return;
+
+        try {
+            // Update self-mute status
+            // If TTS is enabled, we must be unmuted to speak
+            // If TTS is disabled, we mute ourselves to be polite (and indicate we're just listening)
+            const shouldMute = !enabled;
+
+            // Rejoin the channel with the new selfMute setting (Discord.js doesn't have setSelfMute)
+            if (connection.state.status === VoiceConnectionStatus.Ready) {
+                const guild = this.discordClient?.guilds.cache.get(connection.joinConfig.guildId);
+                const channelId = connection.joinConfig.channelId;
+                if (guild && channelId) {
+                    // Rejoin with updated selfMute setting
+                    joinVoiceChannel({
+                        channelId,
+                        guildId: guild.id,
+                        adapterCreator: guild.voiceAdapterCreator as any,
+                        selfDeaf: false,
+                        selfMute: shouldMute,
+                    });
+                    logger.info(`[VoiceSession] Updated self-mute status for ${sessionId}: ${shouldMute ? 'Muted' : 'Unmuted'}`);
+                }
+            }
+
+            // Manage audio player
+            if (enabled) {
+                if (!this.audioPlayers.has(sessionId)) {
+                    const player = createAudioPlayer();
+                    connection.subscribe(player);
+                    this.audioPlayers.set(sessionId, player);
+                    logger.info(`[VoiceSession] Created audio player for ${sessionId}`);
+                }
+            } else {
+                const player = this.audioPlayers.get(sessionId);
+                if (player) {
+                    player.stop();
+                    this.audioPlayers.delete(sessionId);
+                    logger.info(`[VoiceSession] Removed audio player for ${sessionId}`);
+                }
+            }
+        } catch (error) {
+            logger.error(`[VoiceSession] Failed to update TTS state for ${sessionId}:`, error);
+        }
+    }
+
+
+
+    /**
      * Get display name for a user ID
      */
     private async getUserDisplayName(userId: string): Promise<string> {
         if (!this.discordClient) return `User ${userId}`;
-        
+
         try {
             const user = await this.discordClient.users.fetch(userId);
             return user.displayName || user.username || `User ${userId}`;
@@ -107,13 +204,26 @@ export class VoiceSessionManager {
         }
 
         try {
+            // Get dynamic guild config
+            const guildConfig = await runtimeConfig.getGuildConfig(channel.guild.id);
+            
+            // Check master switch - if voice is disabled, don't join
+            if (!guildConfig.voiceEnabled) {
+                logger.info(`Voice is disabled for guild ${channel.guild.id}, not joining`);
+                throw new Error('Voice features are disabled for this server');
+            }
+            
+            const ttsEnabled = guildConfig.ttsEnabled;
+
+            logger.info(`Starting voice session for ${channel.guild.name} (${channel.guild.id}) - TTS Enabled: ${ttsEnabled}`);
+
             // Join voice channel - unmuted if TTS is enabled
             const connection = joinVoiceChannel({
                 channelId: channel.id,
                 guildId: channel.guild.id,
                 adapterCreator: channel.guild.voiceAdapterCreator as any,
                 selfDeaf: false,
-                selfMute: !config.tts.enabled, // Unmute if TTS enabled so we can speak
+                selfMute: !ttsEnabled, // Unmute if TTS enabled so we can speak
             });
 
             // Wait for connection to be ready
@@ -132,8 +242,29 @@ export class VoiceSessionManager {
             this.audioBuffers.set(sessionId, new Map());
             this.recentTranscripts.set(sessionId, []);
 
+            // Create database session record for transcript tracking
+            try {
+                const db = getPrismaClient();
+                const dbSession = await db.voiceSessionTranscript.create({
+                    data: {
+                        serverId: channel.guild.id,
+                        channelId: channel.id,
+                        channelName: channel.name,
+                        startedAt: session.startedAt,
+                        isActive: true,
+                        participantCount: channel.members.filter(m => !m.user.bot).size,
+                        totalMessages: 0,
+                    },
+                });
+                this.dbSessionIds.set(sessionId, dbSession.id);
+                logger.info(`Created database session record: ${dbSession.id}`);
+            } catch (dbError) {
+                logger.error('Failed to create database session record:', dbError);
+                // Continue without DB tracking - transcripts will still work
+            }
+
             // Setup audio player for TTS
-            if (config.tts.enabled) {
+            if (ttsEnabled) {
                 const player = createAudioPlayer();
                 connection.subscribe(player);
                 this.audioPlayers.set(sessionId, player);
@@ -150,11 +281,11 @@ export class VoiceSessionManager {
             this.setupPeriodicSummarization(sessionId);
 
             // Setup chime-in logic if enabled
-            if (config.tts.enabled && config.voiceChat.chimeInEnabled) {
+            if (ttsEnabled && guildConfig.chimeInEnabled) {
                 this.setupChimeInLogic(sessionId, channel);
             }
 
-            logger.info(`Started voice session: ${sessionId} (TTS: ${config.tts.enabled})`);
+            logger.info(`Started voice session: ${sessionId} (TTS: ${ttsEnabled})`);
 
             return session;
         } catch (error) {
@@ -181,6 +312,25 @@ export class VoiceSessionManager {
 
             // Generate final summary
             await this.generateSessionSummary(sessionId);
+
+            // Close the database session record
+            const dbSessionId = this.dbSessionIds.get(sessionId);
+            if (dbSessionId) {
+                try {
+                    const db = getPrismaClient();
+                    await db.voiceSessionTranscript.update({
+                        where: { id: dbSessionId },
+                        data: {
+                            endedAt: new Date(),
+                            isActive: false,
+                        },
+                    });
+                    logger.info(`Closed database session record: ${dbSessionId}`);
+                } catch (dbError) {
+                    logger.error('Failed to close database session record:', dbError);
+                }
+                this.dbSessionIds.delete(sessionId);
+            }
 
             // Clear timers
             const processingTimer = this.processingTimers.get(sessionId);
@@ -239,11 +389,12 @@ export class VoiceSessionManager {
             const audioStream = receiver.subscribe(userId, {
                 end: {
                     behavior: EndBehaviorType.AfterSilence,
-                    duration: 1000, // 1 second of silence
+                    duration: 1500, // 1.5 seconds of silence - captures complete utterances
                 },
             });
 
-            this.handleAudioStream(sessionId, userId, audioStream);
+            const pcmStream = createPcmStreamFromOpus(audioStream, { sessionId, userId });
+            this.handleAudioStream(sessionId, userId, pcmStream);
         });
     }
 
@@ -253,7 +404,7 @@ export class VoiceSessionManager {
     private async handleAudioStream(
         sessionId: string,
         userId: string,
-        stream: AudioReceiveStream
+        stream: Readable
     ): Promise<void> {
         const buffers: Buffer[] = [];
 
@@ -324,9 +475,9 @@ export class VoiceSessionManager {
                     continue;
                 }
 
-                // Check minimum duration (at least 0.3 seconds)
+                // Check minimum duration (at least 0.5 seconds to filter noise)
                 const duration = getAudioDuration(combinedBuffer);
-                if (duration < 0.3) {
+                if (duration < 0.5) {
                     logger.debug(`Skipping short audio (${duration.toFixed(2)}s) for user ${userId}`);
                     buffers.length = 0; // Clear buffers even when skipping
                     continue;
@@ -342,18 +493,38 @@ export class VoiceSessionManager {
                 const transcription = await this.speechService.transcribe(wavBuffer, 'wav');
 
                 if (transcription.text && transcription.text.trim().length > 0) {
-                    // Store transcript chunk
+                    // Get the database session ID for this voice session
+                    const dbSessionId = this.dbSessionIds.get(sessionId);
+                    const userName = await this.getUserDisplayName(userId);
+
+                    // Store transcript chunk with session link
                     await this.memoryService.storeTranscriptChunk({
                         serverId: session.serverId,
                         channelId: session.channelId,
                         userId,
+                        userName,
                         startedAt,
                         endedAt,
                         rawText: transcription.text,
                         metadata: {
                             confidence: transcription.confidence,
                         },
+                        sessionId: dbSessionId || null,
                     });
+
+                    // Increment message count on the DB session
+                    if (dbSessionId) {
+                        try {
+                            const db = getPrismaClient();
+                            await db.voiceSessionTranscript.update({
+                                where: { id: dbSessionId },
+                                data: { totalMessages: { increment: 1 } },
+                            });
+                        } catch (dbErr) {
+                            // Non-critical error - log and continue
+                            logger.debug('Failed to increment session message count:', dbErr);
+                        }
+                    }
 
                     logger.info(`Stored transcript for user ${userId}: ${transcription.text.substring(0, 50)}...`);
 
@@ -373,8 +544,11 @@ export class VoiceSessionManager {
                         });
                     }
 
-                    // If the bot was mentioned in this chunk, respond immediately in VC
-                    if (config.tts.enabled && config.voiceChat.chimeInEnabled && this.mentionsBot(transcription.text)) {
+                    // Check if we should respond
+                    // We need to check the dynamic config for this guild
+                    const guildConfig = await runtimeConfig.getGuildConfig(session.serverId);
+
+                    if (guildConfig.ttsEnabled && guildConfig.chimeInEnabled && this.mentionsBot(transcription.text)) {
                         try {
                             const recent = this.recentTranscripts.get(sessionId) || [];
                             const conversationText = recent
@@ -489,6 +663,10 @@ export class VoiceSessionManager {
         const session = this.sessions.get(sessionId);
         if (!session) return;
 
+        // Check dynamic config
+        const guildConfig = await runtimeConfig.getGuildConfig(session.serverId);
+        if (!guildConfig.ttsEnabled || !guildConfig.chimeInEnabled) return;
+
         // Get recent transcripts
         const lastChime = this.lastChimeTime.get(sessionId) || 0;
         let transcripts = this.recentTranscripts.get(sessionId) || [];
@@ -539,7 +717,7 @@ export class VoiceSessionManager {
 
         // For random chime-ins, check cooldown
         const now = Date.now();
-        if (now - lastChime < config.voiceChat.minSecondsBetweenChimes * 1000) {
+        if (now - lastChime < guildConfig.minSecondsBetweenChimes * 1000) {
             return;
         }
 
@@ -549,7 +727,7 @@ export class VoiceSessionManager {
         }
 
         // Roll for chime-in chance
-        if (Math.random() > config.voiceChat.chimeInChance) {
+        if (Math.random() > guildConfig.chimeInChance) {
             return;
         }
 
@@ -587,6 +765,9 @@ export class VoiceSessionManager {
                 conversationText,
                 []
             );
+
+            // Get dynamic config for response length
+            const guildConfig = await runtimeConfig.getGuildConfig(serverId);
 
             // Different instructions based on whether we're forced to respond
             const instructions = forceResponse
@@ -640,7 +821,7 @@ If you SHOULD chime in, just respond with what you'd say (no explanation, just t
 
             // If forced, always return the response (unless it's literally empty)
             if (forceResponse) {
-                const truncated = response.substring(0, config.voiceChat.maxResponseLength);
+                const truncated = response.substring(0, guildConfig.maxVoiceResponseLength);
                 return {
                     chimeIn: true,
                     reason: 'Bot was mentioned',
@@ -653,7 +834,7 @@ If you SHOULD chime in, just respond with what you'd say (no explanation, just t
             }
 
             // Truncate if too long for voice
-            const truncated = response.substring(0, config.voiceChat.maxResponseLength);
+            const truncated = response.substring(0, guildConfig.maxVoiceResponseLength);
 
             return {
                 chimeIn: true,
@@ -692,7 +873,7 @@ If you SHOULD chime in, just respond with what you'd say (no explanation, just t
 
             // Generate TTS audio
             const ttsResult = await this.ttsService.synthesize(text);
-            
+
             if (!ttsResult.audioBuffer || ttsResult.audioBuffer.length === 0) {
                 logger.error('TTS returned empty audio buffer');
                 return false;
@@ -761,24 +942,24 @@ If you SHOULD chime in, just respond with what you'd say (no explanation, just t
         }
 
         // Check if audio player exists (TTS must have been enabled when session started)
-        const player = this.audioPlayers.get(sessionId);
+        let player = this.audioPlayers.get(sessionId);
+        // If no player, check if we should create one (maybe config changed)
         if (!player) {
-            // Try to create the audio player now if TTS is enabled
-            if (config.tts.enabled) {
+            const guildConfig = await runtimeConfig.getGuildConfig(serverId);
+            if (guildConfig.ttsEnabled) {
                 const connection = this.connections.get(sessionId);
                 if (connection) {
-                    const newPlayer = createAudioPlayer();
-                    connection.subscribe(newPlayer);
-                    this.audioPlayers.set(sessionId, newPlayer);
-                    logger.info(`Created audio player for existing session ${sessionId}`);
-                } else {
-                    logger.error(`Cannot speak: no voice connection for ${sessionId}`);
-                    return false;
+                    player = createAudioPlayer();
+                    connection.subscribe(player);
+                    this.audioPlayers.set(sessionId, player);
+                    logger.info(`Created audio player for existing session ${sessionId} (late init)`);
                 }
-            } else {
-                logger.error('Cannot speak: TTS is disabled in config');
-                return false;
             }
+        }
+
+        if (!player) {
+            logger.error('Cannot speak: TTS is disabled or no player available');
+            return false;
         }
 
         const channel = this.discordClient?.channels.cache.get(channelId) as VoiceChannel;
@@ -795,7 +976,7 @@ If you SHOULD chime in, just respond with what you'd say (no explanation, just t
      */
     storeRecentTranscript(sessionId: string, userId: string, text: string): void {
         const transcripts = this.recentTranscripts.get(sessionId) || [];
-        
+
         transcripts.push({
             userId,
             text,
@@ -842,12 +1023,12 @@ If you SHOULD chime in, just respond with what you'd say (no explanation, just t
      */
     disableAutoJoin(): void {
         this.autoJoinEnabled = false;
-        
+
         if (this.autoJoinCheckInterval) {
             clearInterval(this.autoJoinCheckInterval);
             this.autoJoinCheckInterval = null;
         }
-        
+
         logger.info('Auto-join disabled');
     }
 
@@ -899,11 +1080,11 @@ If you SHOULD chime in, just respond with what you'd say (no explanation, just t
 
         // Not in a VC - find the most popular one
         const popularVC = this.findMostPopularVC(guild);
-        
+
         if (popularVC) {
             const memberCount = popularVC.members.filter(m => !m.user.bot).size;
             logger.info(`Auto-joining ${popularVC.name} in ${guild.name} (${memberCount} members)`);
-            
+
             try {
                 await this.startSession(popularVC);
                 logger.info(`Successfully auto-joined ${popularVC.name}`);
@@ -918,7 +1099,7 @@ If you SHOULD chime in, just respond with what you'd say (no explanation, just t
      */
     findMostPopularVC(guild: Guild): VoiceChannel | null {
         const voiceChannels = guild.channels.cache
-            .filter((channel): channel is VoiceChannel => 
+            .filter((channel): channel is VoiceChannel =>
                 channel.type === ChannelType.GuildVoice
             );
 
@@ -928,7 +1109,7 @@ If you SHOULD chime in, just respond with what you'd say (no explanation, just t
         for (const [, channel] of voiceChannels) {
             // Count non-bot members
             const memberCount = channel.members.filter(m => !m.user.bot).size;
-            
+
             if (memberCount >= this.minMembersToJoin && memberCount > maxMembers) {
                 maxMembers = memberCount;
                 mostPopular = channel;
@@ -968,11 +1149,11 @@ If you SHOULD chime in, just respond with what you'd say (no explanation, just t
         if (existingSession && oldState.channel?.id === existingSession.channelId) {
             const channel = this.discordClient?.channels.cache.get(existingSession.channelId) as VoiceChannel | undefined;
             const remainingMembers = channel?.members.filter(m => !m.user.bot).size || 0;
-            
+
             if (remainingMembers === 0) {
                 logger.info(`Everyone left ${channel?.name}, leaving VC...`);
                 await this.stopSession(guildId, existingSession.channelId);
-                
+
                 // Check if there's another active VC to join
                 setTimeout(() => {
                     this.checkAndJoinGuildVC(guildId, newState.guild!);
@@ -990,7 +1171,7 @@ If you SHOULD chime in, just respond with what you'd say (no explanation, just t
             if (newChannelMembers > currentMembers && newChannelMembers >= this.minMembersToJoin) {
                 logger.info(`More people in ${newState.channel.name} (${newChannelMembers}) than current VC (${currentMembers}), moving...`);
                 await this.stopSession(guildId, existingSession.channelId);
-                
+
                 if (newState.channel.type === ChannelType.GuildVoice) {
                     try {
                         await this.startSession(newState.channel as VoiceChannel);

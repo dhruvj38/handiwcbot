@@ -191,6 +191,8 @@ export interface ServerBible {
         channelCount: number;
         dateRange: { start: Date; end: Date };
         generatedAt: Date;
+        lastIncrementalUpdate?: string;
+        incrementalMessageCount?: number;
     };
 }
 

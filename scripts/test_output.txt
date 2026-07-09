@@ -1,0 +1,9 @@
+Testing with guildId: 778312178574163990
+Initial chimeInChance: 0.7
+Updating chimeInChance to 0.99...
+Service returned chimeInChance: 0.99
+SUCCESS: Service returned updated value.
+DB returned chimeInChance: 0.99
+SUCCESS: Database has updated value.
+Restoring original chimeInChance: 0.7...
+Test completed. Exiting.

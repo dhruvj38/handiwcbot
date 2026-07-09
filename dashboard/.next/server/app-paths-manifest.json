@@ -1,0 +1,7 @@
+{
+  "/page": "app/page.js",
+  "/guilds/[guildId]/page": "app/guilds/[guildId]/page.js",
+  "/guilds/[guildId]/ai/page": "app/guilds/[guildId]/ai/page.js",
+  "/guilds/[guildId]/voice/page": "app/guilds/[guildId]/voice/page.js",
+  "/guilds/[guildId]/logs/page": "app/guilds/[guildId]/logs/page.js"
+}

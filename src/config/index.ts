@@ -25,6 +25,15 @@ interface Config {
             analysis: string;  // Pro model for deep server analysis
             embeddings: string;
         };
+        providers: {
+            chat: 'google' | 'openai';
+            voice: 'google' | 'openai';
+        };
+        openaiApiKey: string;
+        openaiModels: {
+            chat: string;
+            voice: string;
+        };
         maxTokens: number;
         temperature: number;
     };
@@ -37,21 +46,19 @@ interface Config {
         normalizeText: boolean;
     };
 
-    // Text-to-Speech (Google Cloud TTS)
+    // Text-to-Speech (ElevenLabs)
     tts: {
         enabled: boolean;
-        apiKey: string;
-        voiceName: string;
-        languageCode: string;
-        speakingRate: number;
-        pitch: number;
+        apiKey: string;        // ElevenLabs API key
+        model: string;         // ElevenLabs model (eleven_flash_v2_5, eleven_multilingual_v2, etc.)
+        voiceId: string;       // ElevenLabs voice ID
     };
 
-    // Voice Chat Behavior
+    // Voice Chat Behavior (defaults for new guilds)
     voiceChat: {
         autoJoinEnabled: boolean;     // Auto-join popular VCs
         minMembersToJoin: number;     // Min non-bot members to trigger auto-join
-        chimeInEnabled: boolean;
+        chimeInEnabled: boolean;      // Enable chiming in to conversations
         chimeInChance: number;        // 0-1, chance to chime in when relevant
         minSecondsBetweenChimes: number;
         maxResponseLength: number;    // Max chars for voice responses
@@ -60,7 +67,6 @@ interface Config {
     // Bot Configuration
     bot: {
         prefix: string;
-        personality: string;
         maxContextMessages: number;
         voiceChunkDurationMs: number;
         voiceSummaryIntervalMs: number;
@@ -118,24 +124,31 @@ export const config: Config = {
             analysis: getEnvVar('AI_MODEL_ANALYSIS', 'gemini-3-pro-preview'), // Pro model for deep learning
             embeddings: getEnvVar('AI_MODEL_EMBEDDINGS', 'text-embedding-004'),
         },
-        maxTokens: getEnvVarNumber('AI_MAX_TOKENS', 2000),
+        providers: {
+            chat: getEnvVar('AI_CHAT_PROVIDER', 'google') as 'google' | 'openai',
+            voice: getEnvVar('AI_VOICE_PROVIDER', 'google') as 'google' | 'openai',
+        },
+        openaiApiKey: getEnvVarOptional('OPENAI_API_KEY') || '',
+        openaiModels: {
+            chat: getEnvVar('AI_OPENAI_MODEL_CHAT', 'gpt-4o'),
+            voice: getEnvVar('AI_OPENAI_MODEL_VOICE', 'gpt-4o'),
+        },
+        maxTokens: getEnvVarNumber('AI_MAX_TOKENS', 8192),
         temperature: parseFloat(getEnvVar('AI_TEMPERATURE', '0.7')),
     },
 
     speech: {
         provider: (getEnvVar('SPEECH_PROVIDER', 'groq') as 'local' | 'groq'),
         serviceUrl: getEnvVar('SPEECH_SERVICE_URL', 'http://localhost:8000/transcribe'),
-        groqApiKey: getEnvVar('GROQ_API_KEY', ''),
+        groqApiKey: process.env['GROQ_API_KEY'] || '',
         normalizeText: getEnvVar('SPEECH_NORMALIZE_TEXT', 'false') === 'true',
     },
 
     tts: {
         enabled: getEnvVar('TTS_ENABLED', 'false') === 'true',
-        apiKey: getEnvVar('TTS_API_KEY', ''),
-        voiceName: getEnvVar('TTS_VOICE_NAME', 'en-US-Neural2-D'), // Neural2-D = natural male voice
-        languageCode: getEnvVar('TTS_LANGUAGE_CODE', 'en-US'),
-        speakingRate: parseFloat(getEnvVar('TTS_SPEAKING_RATE', '1.0')), // 0.25 - 4.0
-        pitch: parseFloat(getEnvVar('TTS_PITCH', '0.0')), // -20.0 to 20.0
+        apiKey: getEnvVar('ELEVENLABS_API_KEY', ''),
+        model: getEnvVar('TTS_MODEL', 'eleven_flash_v2_5'),
+        voiceId: getEnvVar('TTS_VOICE_ID', 'JBFqnCBsd6RMkjVDRZzb'), // George - deep male voice
     },
 
     voiceChat: {
@@ -149,9 +162,8 @@ export const config: Config = {
 
     bot: {
         prefix: getEnvVar('BOT_PREFIX', '!'),
-        personality: getEnvVar('BOT_PERSONALITY', 'friendly and helpful'),
         maxContextMessages: getEnvVarNumber('MAX_CONTEXT_MESSAGES', 50),
-        voiceChunkDurationMs: getEnvVarNumber('VOICE_CHUNK_DURATION_MS', 30000),
+        voiceChunkDurationMs: getEnvVarNumber('VOICE_CHUNK_DURATION_MS', 5000),
         voiceSummaryIntervalMs: getEnvVarNumber('VOICE_SUMMARY_INTERVAL_MS', 300000),
         memoryRetrievalLimit: getEnvVarNumber('MEMORY_RETRIEVAL_LIMIT', 10),
     },
